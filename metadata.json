@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Remix: SPIKEDAI: Document Intelligence \u0026 Cloud Strategy",
+  "description": "Enterprise document scraping and OCR for cloud modernization. Analyze chatlogs and documents from AWS, Salesforce, or Azure to generate structured cloud strategies.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
