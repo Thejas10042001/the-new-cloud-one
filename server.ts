@@ -129,6 +129,58 @@ async function startServer() {
     }
   });
 
+  // Real-Time Transcript SSE Endpoint
+  app.get("/api/transcripts/:botId", (req, res) => {
+    const { botId } = req.params;
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    console.log(`SSE Client connected for bot: ${botId}`);
+
+    // Mock transcript generation for demonstration
+    // In a real app, this would be triggered by Recall.ai webhooks
+    let segmentId = 1;
+    const speakers = ["Architect", "CTO", "VP Ops", "Security Lead"];
+    const phrases = [
+      "We need to consider the latency requirements for the new API.",
+      "The current database is struggling with the analytical load.",
+      "Security is our top priority for this modernization.",
+      "What is the estimated timeline for the pilot phase?",
+      "We should look into AWS Lambda for the processing layer.",
+      "The budget for OpEx is strictly capped at $20k.",
+      "How are we handling data residency for GDPR compliance?",
+      "The legacy system has too much technical debt.",
+      "We need a robust CI/CD pipeline for the new microservices.",
+      "Zero Trust architecture is the way forward."
+    ];
+
+    const interval = setInterval(() => {
+      const segment = {
+        id: segmentId++,
+        speaker: speakers[Math.floor(Math.random() * speakers.length)],
+        text: phrases[Math.floor(Math.random() * phrases.length)],
+        start: segmentId * 5,
+        end: segmentId * 5 + 4,
+        language: "en",
+        created_at: new Date().toISOString()
+      };
+
+      res.write(`data: ${JSON.stringify(segment)}\n\n`);
+
+      // Reset simulation
+      if (segmentId > 50) segmentId = 1;
+    }, 3000);
+
+    req.on("close", () => {
+      clearInterval(interval);
+      console.log(`SSE Client disconnected for bot: ${botId}`);
+      res.end();
+    });
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

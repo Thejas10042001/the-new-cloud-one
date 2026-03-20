@@ -103,6 +103,8 @@ interface TranscriptSegment {
   end: number;
   text: string;
   speaker: string | null;
+  language?: string;
+  created_at?: string;
 }
 
 interface AnalysisResult {
@@ -257,6 +259,18 @@ const loadFromIndexedDB = async (storeName: string, key?: string): Promise<any> 
   }
 };
 
+const saveToIndexedDB = async (storeName: string, data: any): Promise<void> => {
+  try {
+    const db = await initDB();
+    if (!db.objectStoreNames.contains(storeName)) return;
+    const transaction = db.transaction([storeName], 'readwrite');
+    const store = transaction.objectStore(storeName);
+    store.put(data);
+  } catch (error) {
+    console.error('Error saving to IndexedDB:', error);
+  }
+};
+
 const SAMPLE_TRANSCRIPT = `Architect: Thanks for joining today. I understand your team is looking to modernize the core claims processing system. Can you walk me through the current state?
 CTO: Right now, we're on-prem. It's a monolithic Java app running on aging hardware. We're seeing 15-minute downtime windows every Tuesday during deployments.
 Architect: That's significant. What's the business impact?
@@ -292,6 +306,9 @@ export default function App() {
   const [isSpikedLoading, setIsSpikedLoading] = useState(false);
   const [spikedConnectionStatus, setSpikedConnectionStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   const [spikedTranscript, setSpikedTranscript] = useState<TranscriptSegment[]>([]);
+  const [slidingWindowTranscript, setSlidingWindowTranscript] = useState<TranscriptSegment[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<'Connected' | 'Reconnecting' | 'Disconnected'>('Disconnected');
+  const [retryCount, setRetryCount] = useState(0);
   const [recallBotId, setRecallBotId] = useState<string | null>(null);
   const [recallMeetingUrl, setRecallMeetingUrl] = useState('');
   const [livePerson1, setLivePerson1] = useState('');
@@ -433,32 +450,93 @@ export default function App() {
     }
   };
 
-  // Recall.ai Polling Logic
+  // Real-Time Transcript SSE Logic
   useEffect(() => {
     if (!recallBotId || inputMode !== 'spiked') return;
 
-    const pollTranscript = async () => {
-      try {
-        const response = await fetch(`/api/recall/bot/${recallBotId}/transcript`);
-        const data = await response.json();
-        if (Array.isArray(data)) {
-          const segments: TranscriptSegment[] = data.map((item: any, i: number) => ({
-            id: i,
-            start: item.start_time,
-            end: item.end_time,
-            speaker: item.speaker || 'Unknown',
-            text: item.text
-          }));
-          setSpikedTranscript(segments);
+    let eventSource: EventSource | null = null;
+    let reconnectTimeout: any;
+
+    const connect = () => {
+      setConnectionStatus('Reconnecting');
+      eventSource = new EventSource(`/api/transcripts/${recallBotId}`);
+
+      eventSource.onopen = () => {
+        setConnectionStatus('Connected');
+        setRetryCount(0);
+      };
+
+      eventSource.onmessage = (event) => {
+        try {
+          const newSegment: TranscriptSegment = JSON.parse(event.data);
+          
+          setSpikedTranscript((prev) => {
+            // Meeting Reset Handling
+            if (newSegment.id === 1) {
+              return [newSegment];
+            }
+
+            // Duplicate Transcript Protection
+            const lastSegment = prev[prev.length - 1];
+            if (lastSegment && lastSegment.text === newSegment.text) {
+              return prev;
+            }
+
+            const updated = [...prev, newSegment];
+            
+            // Persistent Storage - Session Storage
+            sessionStorage.setItem('meeting_transcript', JSON.stringify(updated));
+            
+            // Persistent Storage - IndexedDB
+            saveToIndexedDB(TRANSCRIPTS_STORE, { meetingId: recallBotId, data: updated });
+
+            return updated;
+          });
+        } catch (err) {
+          console.error("Error parsing SSE data:", err);
         }
-      } catch (error) {
-        console.error("Polling Error:", error);
-      }
+      };
+
+      eventSource.onerror = () => {
+        setConnectionStatus('Disconnected');
+        eventSource?.close();
+        setRetryCount((prev) => prev + 1);
+        reconnectTimeout = setTimeout(connect, 5000); // Auto-reconnect
+      };
     };
 
-    const interval = setInterval(pollTranscript, 5000);
-    return () => clearInterval(interval);
+    connect();
+
+    // Session Recovery
+    const recoverSession = async () => {
+      const sessionData = sessionStorage.getItem('meeting_transcript');
+      if (sessionData) {
+        setSpikedTranscript(JSON.parse(sessionData));
+      } else {
+        const idbData = await loadFromIndexedDB(TRANSCRIPTS_STORE, recallBotId);
+        if (idbData) {
+          setSpikedTranscript(idbData.data);
+        }
+      }
+    };
+    recoverSession();
+
+    return () => {
+      eventSource?.close();
+      clearTimeout(reconnectTimeout);
+    };
   }, [recallBotId, inputMode]);
+
+  // Sliding Window for Live Context
+  useEffect(() => {
+    setSlidingWindowTranscript(spikedTranscript.slice(-20));
+    
+    // Auto-scroll to bottom
+    const end = document.getElementById('transcript-end');
+    if (end) {
+      end.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [spikedTranscript]);
 
   const groupTranscriptBySpeaker = (segments: TranscriptSegment[]) => {
     if (!segments || segments.length === 0) return [];
@@ -725,7 +803,13 @@ export default function App() {
     } else if (inputMode === 'live') {
       finalTranscript = `Customer: ${livePerson1}\nArchitect: ${livePerson2}`;
     } else if (inputMode === 'spiked') {
-      finalTranscript = spikedTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
+      const activeTranscript = connectionStatus === 'Connected' && slidingWindowTranscript.length > 0 
+        ? slidingWindowTranscript 
+        : spikedTranscript;
+      const contextPrefix = connectionStatus === 'Connected' && slidingWindowTranscript.length > 0 
+        ? "[LIVE MEETING CONTEXT]\n\n" 
+        : "";
+      finalTranscript = contextPrefix + activeTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
     }
 
     if (!finalTranscript.trim()) return;
@@ -948,9 +1032,19 @@ export default function App() {
                   <button onClick={loadSample} className="text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black">Sample</button>
                 </div>
 
-                <div className="flex items-center gap-2 text-black/40 mt-2">
-                  <FileText className="w-3 h-3" />
-                  <span className="text-[10px] font-bold uppercase tracking-widest">Transcript Section</span>
+                <div className="flex items-center justify-between text-black/40 mt-2">
+                  <div className="flex items-center gap-2">
+                    <FileText className="w-3 h-3" />
+                    <span className="text-[10px] font-bold uppercase tracking-widest">Transcript Section</span>
+                  </div>
+                  {inputMode === 'paste' && transcript.trim() && (
+                    <button 
+                      onClick={() => setTranscript('')} 
+                      className="text-[9px] font-bold uppercase tracking-widest hover:text-red-600 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
                 </div>
 
                 {inputMode === 'paste' ? (
@@ -1161,24 +1255,82 @@ export default function App() {
                           <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 animate-pulse">Establishing Secure Connection...</p>
                         </div>
                       ) : spikedTranscript.length > 0 ? (
-                        <div className="flex flex-col items-center gap-4">
-                          <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center">
-                            <FileCheck className="w-8 h-8 text-emerald-600" />
+                        <div className="w-full space-y-4">
+                          <div className="flex items-center justify-between px-2">
+                            <div className="flex items-center gap-3">
+                              <div className={cn(
+                                "w-2 h-2 rounded-full animate-pulse",
+                                connectionStatus === 'Connected' ? "bg-emerald-500" : connectionStatus === 'Reconnecting' ? "bg-amber-500" : "bg-red-500"
+                              )} />
+                              <span className="text-[10px] font-black uppercase tracking-widest text-black/60">
+                                {connectionStatus === 'Connected' ? "● Live Meeting" : connectionStatus}
+                                {retryCount > 0 && ` (Retry ${retryCount})`}
+                                {connectionStatus === 'Connected' && <span className="ml-2 text-black/20">|</span>}
+                                {connectionStatus === 'Connected' && <span className="ml-2 text-emerald-600">Syncing Intelligence</span>}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-4">
+                              <button 
+                                onClick={() => {
+                                  const text = spikedTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
+                                  navigator.clipboard.writeText(text);
+                                }}
+                                className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black/60 transition-colors"
+                                title="Copy Transcript"
+                              >
+                                <Send className="w-3 h-3 rotate-45" />
+                                Copy
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  const text = spikedTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
+                                  const blob = new Blob([text], { type: 'text/plain' });
+                                  const url = URL.createObjectURL(blob);
+                                  const a = document.createElement('a');
+                                  a.href = url;
+                                  a.download = `Meeting_Transcript_${new Date().toISOString().split('T')[0]}.txt`;
+                                  a.click();
+                                }}
+                                className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black/60 transition-colors"
+                                title="Download Transcript"
+                              >
+                                <Upload className="w-3 h-3 rotate-180" />
+                                Download
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  setSpikedTranscript([]);
+                                  setRecallBotId(null);
+                                  setSpikedConnectionStatus('idle');
+                                  sessionStorage.removeItem('meeting_transcript');
+                                }}
+                                className="text-[9px] font-bold uppercase tracking-widest text-red-600 hover:text-red-700 transition-colors"
+                              >
+                                Disconnect
+                              </button>
+                            </div>
                           </div>
-                          <div className="space-y-1">
-                            <p className="text-[11px] font-black text-emerald-700 uppercase tracking-widest">Spiked Intelligence Connected</p>
-                            <p className="text-[9px] text-emerald-600/60 font-bold uppercase tracking-widest">{spikedTranscript.length} Segments Synchronized</p>
+                          
+                          <div className="bg-white border border-black/5 rounded-2xl p-6 h-[400px] overflow-y-auto custom-scrollbar space-y-6 text-left shadow-inner">
+                            {groupTranscriptBySpeaker(spikedTranscript).map((group, idx) => (
+                              <div key={idx} className="space-y-1 animate-in fade-in slide-in-from-bottom-2 duration-500">
+                                <span className="text-[9px] font-black uppercase tracking-widest text-black/30 block">{group.speaker || 'Unknown'}</span>
+                                <p className="text-xs leading-relaxed text-black/70">{group.text}</p>
+                              </div>
+                            ))}
+                            <div id="transcript-end" />
                           </div>
-                          <button 
-                            onClick={() => {
-                              setSpikedTranscript([]);
-                              setRecallBotId(null);
-                              setSpikedConnectionStatus('idle');
-                            }}
-                            className="text-[9px] font-bold uppercase tracking-widest text-emerald-600 hover:text-emerald-700 underline underline-offset-8"
-                          >
-                            Disconnect and Clear
-                          </button>
+
+                          <div className="flex items-center justify-between px-2 pt-2">
+                            <div className="flex items-center gap-2">
+                              <History className="w-3 h-3 text-black/20" />
+                              <span className="text-[9px] font-bold uppercase tracking-widest text-black/30">{spikedTranscript.length} Segments Captured</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Database className="w-3 h-3 text-black/20" />
+                              <span className="text-[9px] font-bold uppercase tracking-widest text-black/30">Stored in IndexedDB</span>
+                            </div>
+                          </div>
                         </div>
                       ) : (
                         <>
