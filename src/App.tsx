@@ -43,6 +43,9 @@ import { analyzeTranscript, performOCR, validateDocumentMatch, diarizeSpeaker } 
 import { cn } from './lib/utils';
 import mammoth from 'mammoth';
 import mermaid from 'mermaid';
+import { useTranscriptStream } from './hooks/useTranscriptStream';
+import { LiveTranscriptPanel } from './components/LiveTranscriptPanel';
+import { TranscriptSegment } from './types/transcriptTypes';
 import { 
   BarChart, 
   Bar, 
@@ -96,16 +99,6 @@ const Mermaid = ({ chart }: { chart: string }) => {
   );
 };
 
-
-interface TranscriptSegment {
-  id: number;
-  start: number;
-  end: number;
-  text: string;
-  speaker: string | null;
-  language?: string;
-  created_at?: string;
-}
 
 interface AnalysisResult {
   client_snapshot: {
@@ -302,15 +295,7 @@ export default function App() {
   const [transcript, setTranscript] = useState('');
   const [documentText, setDocumentText] = useState('');
   const [documentName, setDocumentName] = useState('');
-  const [inputMode, setInputMode] = useState<'paste' | 'live' | 'upload' | 'spiked'>('paste');
-  const [isSpikedLoading, setIsSpikedLoading] = useState(false);
-  const [spikedConnectionStatus, setSpikedConnectionStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
-  const [spikedTranscript, setSpikedTranscript] = useState<TranscriptSegment[]>([]);
-  const [slidingWindowTranscript, setSlidingWindowTranscript] = useState<TranscriptSegment[]>([]);
-  const [connectionStatus, setConnectionStatus] = useState<'Connected' | 'Reconnecting' | 'Disconnected'>('Disconnected');
-  const [retryCount, setRetryCount] = useState(0);
-  const [recallBotId, setRecallBotId] = useState<string | null>(null);
-  const [recallMeetingUrl, setRecallMeetingUrl] = useState('');
+  const [inputMode, setInputMode] = useState<'paste' | 'live' | 'upload'>('paste');
   const [livePerson1, setLivePerson1] = useState('');
   const [livePerson2, setLivePerson2] = useState('');
   const [person1VoiceSample, setPerson1VoiceSample] = useState<string | null>(null);
@@ -360,243 +345,16 @@ export default function App() {
   const [loadingMessage, setLoadingMessage] = useState('');
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
 
-  const loadSpikedTranscript = async () => {
-    if (recallMeetingUrl) {
-      // Real Recall.ai Integration
-      setIsSpikedLoading(true);
-      setSpikedConnectionStatus('connecting');
-      try {
-        const response = await fetch("/api/recall/bot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ meeting_url: recallMeetingUrl }),
-        });
-        const data = await response.json();
-        if (data.id) {
-          setRecallBotId(data.id);
-          setSpikedConnectionStatus('connected');
-        } else {
-          setSpikedConnectionStatus('error');
-        }
-      } catch (error) {
-        console.error("Recall Bot Error:", error);
-        setSpikedConnectionStatus('error');
-      } finally {
-        setIsSpikedLoading(false);
-      }
-      return;
-    }
+  const [botId, setBotId] = useState<string | null>('demo-bot');
 
-    // Fallback to local discovery logic if no URL provided
-    setIsSpikedLoading(true);
-    setSpikedConnectionStatus('connecting');
-    try {
-      // Strategy 1: Check multiple session storage keys used by SpikedAI
-      const storageKeys = [
-        'spikedai_current_transcript',
-        'spikedai_main_transcript',
-        'spikedai_live_transcript',
-        'spikedai_transcript',
-        'spikedai_transcript_segments',
-        'current_meeting_transcript',
-        'transcript_data',
-        'meeting_segments'
-      ];
-
-      for (const key of storageKeys) {
-        const raw = window.sessionStorage.getItem(key);
-        if (raw) {
-          try {
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              setSpikedTranscript(parsed);
-              setIsSpikedLoading(false);
-              setSpikedConnectionStatus('connected');
-              return;
-            }
-          } catch (e) {}
-        }
-      }
-
-      // Strategy 2: Check IndexedDB for any stored transcripts
-      const allEntries = await loadFromIndexedDB(TRANSCRIPTS_STORE);
-      if (allEntries && allEntries.length > 0) {
-        const validEntries = allEntries.filter((e: any) => e.data && Array.isArray(e.data) && e.data.length > 0);
-        if (validEntries.length > 0) {
-          // Use the entry with the most segments
-          const bestEntry = validEntries.reduce((prev: any, current: any) => 
-            (current.data.length > prev.data.length) ? current : prev
-          );
-          setSpikedTranscript(bestEntry.data);
-          setIsSpikedLoading(false);
-          setSpikedConnectionStatus('connected');
-          return;
-        }
-      }
-
-      // Strategy 3: Fallback to sample only if absolutely nothing else is found
-      const sampleSegments: TranscriptSegment[] = SAMPLE_TRANSCRIPT.split('\n').map((line, i) => {
-        const [speaker, ...text] = line.split(': ');
-        return { id: i, start: i * 10, end: (i + 1) * 10, speaker: speaker || 'Unknown', text: text.join(': ') || line };
-      });
-      setSpikedTranscript(sampleSegments);
-      setSpikedConnectionStatus('error');
-      
-    } catch (e) {
-      console.error("Load error", e);
-      setSpikedConnectionStatus('error');
-    } finally {
-      setIsSpikedLoading(false);
-    }
-  };
-
-  // Real-Time Transcript SSE Logic
-  useEffect(() => {
-    if (!recallBotId || inputMode !== 'spiked') return;
-
-    let eventSource: EventSource | null = null;
-    let reconnectTimeout: any;
-
-    const connect = () => {
-      setConnectionStatus('Reconnecting');
-      eventSource = new EventSource(`/api/transcripts/${recallBotId}`);
-
-      eventSource.onopen = () => {
-        setConnectionStatus('Connected');
-        setRetryCount(0);
-      };
-
-      eventSource.onmessage = (event) => {
-        try {
-          const newSegment: TranscriptSegment = JSON.parse(event.data);
-          
-          setSpikedTranscript((prev) => {
-            // Meeting Reset Handling
-            if (newSegment.id === 1) {
-              return [newSegment];
-            }
-
-            // Duplicate Transcript Protection
-            const lastSegment = prev[prev.length - 1];
-            if (lastSegment && lastSegment.text === newSegment.text) {
-              return prev;
-            }
-
-            const updated = [...prev, newSegment];
-            
-            // Persistent Storage - Session Storage
-            sessionStorage.setItem('meeting_transcript', JSON.stringify(updated));
-            
-            // Persistent Storage - IndexedDB
-            saveToIndexedDB(TRANSCRIPTS_STORE, { meetingId: recallBotId, data: updated });
-
-            return updated;
-          });
-        } catch (err) {
-          console.error("Error parsing SSE data:", err);
-        }
-      };
-
-      eventSource.onerror = () => {
-        setConnectionStatus('Disconnected');
-        eventSource?.close();
-        setRetryCount((prev) => prev + 1);
-        reconnectTimeout = setTimeout(connect, 5000); // Auto-reconnect
-      };
-    };
-
-    connect();
-
-    // Session Recovery
-    const recoverSession = async () => {
-      const sessionData = sessionStorage.getItem('meeting_transcript');
-      if (sessionData) {
-        setSpikedTranscript(JSON.parse(sessionData));
-      } else {
-        const idbData = await loadFromIndexedDB(TRANSCRIPTS_STORE, recallBotId);
-        if (idbData) {
-          setSpikedTranscript(idbData.data);
-        }
-      }
-    };
-    recoverSession();
-
-    return () => {
-      eventSource?.close();
-      clearTimeout(reconnectTimeout);
-    };
-  }, [recallBotId, inputMode]);
-
-  // Sliding Window for Live Context
-  useEffect(() => {
-    setSlidingWindowTranscript(spikedTranscript.slice(-20));
-    
-    // Auto-scroll to bottom
-    const end = document.getElementById('transcript-end');
-    if (end) {
-      end.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [spikedTranscript]);
-
-  const groupTranscriptBySpeaker = (segments: TranscriptSegment[]) => {
-    if (!segments || segments.length === 0) return [];
-    const groups: { speaker: string | null, text: string, id: number }[] = [];
-    let currentGroup: { speaker: string | null, text: string, id: number } | null = null;
-    
-    segments.forEach((segment, index) => {
-      if (currentGroup && currentGroup.speaker === segment.speaker) {
-        currentGroup.text += ' ' + segment.text;
-      } else {
-        if (currentGroup) groups.push(currentGroup);
-        currentGroup = { speaker: segment.speaker, text: segment.text, id: segment.id || index };
-      }
-    });
-    if (currentGroup) groups.push(currentGroup);
-    return groups;
-  };
-
-  // Spiked Sync Logic
-  useEffect(() => {
-    if (inputMode !== 'spiked') return;
-
-    const syncFromStorage = () => {
-      try {
-        const raw = window.sessionStorage.getItem('spikedai_current_transcript');
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            setSpikedTranscript(parsed);
-          }
-        }
-      } catch (e) {
-        console.error("Sync error", e);
-      }
-    };
-
-    // Initial sync
-    syncFromStorage();
-
-    // Listen for storage changes (cross-tab)
-    window.addEventListener('storage', (e) => {
-      if (e.key === 'spikedai_current_transcript') syncFromStorage();
-    });
-
-    // BroadcastChannel for instant sync if available
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel('spikedai_transcript_updates');
-      bc.onmessage = (event) => {
-        if (event.data.type === 'new_segment' || event.data.type === 'full_sync') {
-          syncFromStorage();
-        }
-      };
-    } catch (e) {}
-
-    return () => {
-      window.removeEventListener('storage', syncFromStorage);
-      if (bc) bc.close();
-    };
-  }, [inputMode]);
+  // Live Transcript Stream Hook
+  const { 
+    transcript: streamTranscript, 
+    isConnected, 
+    error: streamError, 
+    getLiveTranscriptContext,
+    clearTranscript: clearStreamTranscript
+  } = useTranscriptStream(botId);
 
   useEffect(() => {
     let recognition: any = null;
@@ -801,15 +559,7 @@ export default function App() {
     if (inputMode === 'paste' || inputMode === 'upload') {
       finalTranscript = transcript;
     } else if (inputMode === 'live') {
-      finalTranscript = `Customer: ${livePerson1}\nArchitect: ${livePerson2}`;
-    } else if (inputMode === 'spiked') {
-      const activeTranscript = connectionStatus === 'Connected' && slidingWindowTranscript.length > 0 
-        ? slidingWindowTranscript 
-        : spikedTranscript;
-      const contextPrefix = connectionStatus === 'Connected' && slidingWindowTranscript.length > 0 
-        ? "[LIVE MEETING CONTEXT]\n\n" 
-        : "";
-      finalTranscript = contextPrefix + activeTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
+      finalTranscript = getLiveTranscriptContext() || `Customer: ${livePerson1}\nArchitect: ${livePerson2}`;
     }
 
     if (!finalTranscript.trim()) return;
@@ -1022,12 +772,6 @@ export default function App() {
                     >
                       Live
                     </button>
-                    <button 
-                      onClick={() => setInputMode('spiked')}
-                      className={cn("px-3 py-1 rounded-md text-[9px] font-bold uppercase tracking-widest transition-all", inputMode === 'spiked' ? "bg-white shadow-sm text-black" : "text-black/40")}
-                    >
-                      Connect with Spiked
-                    </button>
                   </div>
                   <button onClick={loadSample} className="text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black">Sample</button>
                 </div>
@@ -1103,322 +847,121 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                ) : inputMode === 'live' ? (
-                  <div className="space-y-4">
-                    {/* Voice Profiles Section */}
-                    <div className="bg-black/5 rounded-2xl p-4 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2 text-black/40">
-                          <Users className="w-3 h-3" />
-                          <span className="text-[9px] font-bold uppercase tracking-widest">Voice Profiles</span>
-                        </div>
-                        <label className="flex items-center gap-2 cursor-pointer group">
-                          <div className="flex flex-col items-end mr-1">
-                            <span className="text-[8px] font-bold uppercase tracking-widest text-black/40 group-hover:text-black transition-colors">Auto-Detect</span>
-                            <span className="text-[6px] font-bold uppercase tracking-widest text-emerald-500/60">Voice Tone AI</span>
-                          </div>
-                          <div 
-                            onClick={() => setIsAutoDiarizationEnabled(!isAutoDiarizationEnabled)}
-                            className={cn(
-                              "w-8 h-4.5 rounded-full transition-all relative",
-                              isAutoDiarizationEnabled ? "bg-emerald-500 shadow-sm shadow-emerald-500/20" : "bg-black/10"
-                            )}
-                          >
-                            <div className={cn(
-                              "absolute top-0.5 w-3.5 h-3.5 bg-white rounded-full transition-all shadow-sm",
-                              isAutoDiarizationEnabled ? "left-4" : "left-0.5"
-                            )} />
-                          </div>
-                        </label>
-                      </div>
-                      
-                      <div className="grid grid-cols-2 gap-3">
-                        <div className="space-y-2">
-                          <p className="text-[8px] font-bold uppercase tracking-widest text-black/30">Person 1</p>
-                          <label className={cn(
-                            "flex flex-col items-center justify-center p-2 border border-dashed rounded-xl cursor-pointer transition-all",
-                            person1VoiceSample ? "border-emerald-200 bg-emerald-50/30" : "border-black/10 hover:bg-black/5"
-                          )}>
-                            <Volume2 className={cn("w-3 h-3 mb-1", person1VoiceSample ? "text-emerald-500" : "text-black/20")} />
-                            <span className="text-[7px] font-bold uppercase tracking-widest text-black/40">
-                              {person1VoiceSample ? "Sample Loaded" : "Upload Voice"}
-                            </span>
-                            <input 
-                              type="file" 
-                              className="hidden" 
-                              accept="audio/*" 
-                              onChange={(e) => {
-                                const file = e.target.files?.[0];
-                                if (file) {
-                                  const reader = new FileReader();
-                                  reader.onload = () => setPerson1VoiceSample(reader.result as string);
-                                  reader.readAsDataURL(file);
-                                }
-                              }} 
-                            />
-                          </label>
-                        </div>
-                        <div className="space-y-2">
-                          <p className="text-[8px] font-bold uppercase tracking-widest text-black/30">Person 2</p>
-                          <label className={cn(
-                            "flex flex-col items-center justify-center p-2 border border-dashed rounded-xl cursor-pointer transition-all",
-                            person2VoiceSample ? "border-emerald-200 bg-emerald-50/30" : "border-black/10 hover:bg-black/5"
-                          )}>
-                            <Volume2 className={cn("w-3 h-3 mb-1", person2VoiceSample ? "text-emerald-500" : "text-black/20")} />
-                            <span className="text-[7px] font-bold uppercase tracking-widest text-black/40">
-                              {person2VoiceSample ? "Sample Loaded" : "Upload Voice"}
-                            </span>
-                            <input 
-                              type="file" 
-                              className="hidden" 
-                              accept="audio/*" 
-                              onChange={(e) => {
-                                const file = e.target.files?.[0];
-                                if (file) {
-                                  const reader = new FileReader();
-                                  reader.onload = () => setPerson2VoiceSample(reader.result as string);
-                                  reader.readAsDataURL(file);
-                                }
-                              }} 
-                            />
-                          </label>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className={cn(
-                      "space-y-2 p-2 rounded-2xl transition-all border border-transparent",
-                      activeSpeaker === 1 && isRecording && "bg-red-50/50 border-red-100 shadow-sm"
-                    )}>
-                      <div className="flex justify-between items-center px-1">
-                        <label className="text-[9px] font-bold uppercase tracking-widest text-black/40">Person 1 (Customer)</label>
-                        {isRecording && (
-                          <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 rounded-full border border-red-100">
-                            <div className="flex gap-0.5">
-                              <div className="w-0.5 h-2 bg-red-400 animate-[bounce_1s_infinite_0ms]" />
-                              <div className="w-0.5 h-3 bg-red-500 animate-[bounce_1s_infinite_200ms]" />
-                              <div className="w-0.5 h-2 bg-red-400 animate-[bounce_1s_infinite_400ms]" />
-                            </div>
-                            <span className="text-[7px] font-black text-red-600 uppercase tracking-widest">Analyzing Tone</span>
-                          </div>
-                        )}
-                      </div>
-                      <textarea
-                        value={livePerson1}
-                        onChange={(e) => setLivePerson1(e.target.value)}
-                        onFocus={() => setActiveSpeaker(1)}
-                        placeholder="Customer speaking..."
-                        className="w-full h-[140px] bg-white border border-black/10 rounded-2xl p-4 text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-black/5 transition-all resize-none shadow-sm"
-                      />
-                    </div>
-                    <div className={cn(
-                      "space-y-2 p-2 rounded-2xl transition-all border border-transparent",
-                      activeSpeaker === 2 && isRecording && "bg-red-50/50 border-red-100 shadow-sm"
-                    )}>
-                      <div className="flex justify-between items-center px-1">
-                        <label className="text-[9px] font-bold uppercase tracking-widest text-black/40">Person 2 (Architect)</label>
-                        {isRecording && activeSpeaker === 2 && (
-                          <div className="flex items-center gap-1">
-                            <div className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse" />
-                            <span className="text-[8px] font-bold text-red-500 uppercase tracking-widest">Listening</span>
-                          </div>
-                        )}
-                      </div>
-                      <textarea
-                        value={livePerson2}
-                        onChange={(e) => setLivePerson2(e.target.value)}
-                        onFocus={() => setActiveSpeaker(2)}
-                        placeholder="Architect speaking..."
-                        className="w-full h-[140px] bg-white border border-black/10 rounded-2xl p-4 text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-black/5 transition-all resize-none shadow-sm"
-                      />
-                    </div>
-                    <button 
-                      onClick={() => setIsRecording(!isRecording)}
-                      className={cn(
-                        "w-full flex items-center justify-center gap-2 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all border",
-                        isRecording ? "bg-red-600 border-red-700 text-white shadow-lg shadow-red-500/20" : "bg-black/5 border-transparent text-black/40 hover:bg-black/10"
-                      )}
-                    >
-                      {isRecording ? <Square className="w-3 h-3" /> : <Mic className="w-3 h-3" />}
-                      {isRecording ? "Stop Listening" : "Start Real-time Transcription"}
-                    </button>
-                  </div>
                 ) : (
-                  <div className="space-y-4">
-                    <div className={cn(
-                      "relative border-2 border-dashed rounded-2xl p-8 transition-all flex flex-col items-center justify-center text-center gap-6",
-                      spikedTranscript.length > 0 ? "border-emerald-200 bg-emerald-50/30" : "border-black/5 bg-white hover:border-black/10"
-                    )}>
-                      {isSpikedLoading ? (
-                        <div className="flex flex-col items-center gap-4">
-                          <Loader2 className="w-10 h-10 animate-spin text-red-600" />
-                          <p className="text-[10px] font-bold uppercase tracking-widest text-black/40 animate-pulse">Establishing Secure Connection...</p>
-                        </div>
-                      ) : spikedTranscript.length > 0 ? (
-                        <div className="w-full space-y-4">
-                          <div className="flex items-center justify-between px-2">
-                            <div className="flex items-center gap-3">
-                              <div className={cn(
-                                "w-2 h-2 rounded-full animate-pulse",
-                                connectionStatus === 'Connected' ? "bg-emerald-500" : connectionStatus === 'Reconnecting' ? "bg-amber-500" : "bg-red-500"
-                              )} />
-                              <span className="text-[10px] font-black uppercase tracking-widest text-black/60">
-                                {connectionStatus === 'Connected' ? "● Live Meeting" : connectionStatus}
-                                {retryCount > 0 && ` (Retry ${retryCount})`}
-                                {connectionStatus === 'Connected' && <span className="ml-2 text-black/20">|</span>}
-                                {connectionStatus === 'Connected' && <span className="ml-2 text-emerald-600">Syncing Intelligence</span>}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-4">
-                              <button 
-                                onClick={() => {
-                                  const text = spikedTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
-                                  navigator.clipboard.writeText(text);
-                                }}
-                                className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black/60 transition-colors"
-                                title="Copy Transcript"
-                              >
-                                <Send className="w-3 h-3 rotate-45" />
-                                Copy
-                              </button>
-                              <button 
-                                onClick={() => {
-                                  const text = spikedTranscript.map(s => `${s.speaker || 'Unknown'}: ${s.text}`).join('\n');
-                                  const blob = new Blob([text], { type: 'text/plain' });
-                                  const url = URL.createObjectURL(blob);
-                                  const a = document.createElement('a');
-                                  a.href = url;
-                                  a.download = `Meeting_Transcript_${new Date().toISOString().split('T')[0]}.txt`;
-                                  a.click();
-                                }}
-                                className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black/60 transition-colors"
-                                title="Download Transcript"
-                              >
-                                <Upload className="w-3 h-3 rotate-180" />
-                                Download
-                              </button>
-                              <button 
-                                onClick={() => {
-                                  setSpikedTranscript([]);
-                                  setRecallBotId(null);
-                                  setSpikedConnectionStatus('idle');
-                                  sessionStorage.removeItem('meeting_transcript');
-                                }}
-                                className="text-[9px] font-bold uppercase tracking-widest text-red-600 hover:text-red-700 transition-colors"
-                              >
-                                Disconnect
-                              </button>
-                            </div>
-                          </div>
-                          
-                          <div className="bg-white border border-black/5 rounded-2xl p-6 h-[400px] overflow-y-auto custom-scrollbar space-y-6 text-left shadow-inner">
-                            {groupTranscriptBySpeaker(spikedTranscript).map((group, idx) => (
-                              <div key={idx} className="space-y-1 animate-in fade-in slide-in-from-bottom-2 duration-500">
-                                <span className="text-[9px] font-black uppercase tracking-widest text-black/30 block">{group.speaker || 'Unknown'}</span>
-                                <p className="text-xs leading-relaxed text-black/70">{group.text}</p>
-                              </div>
-                            ))}
-                            <div id="transcript-end" />
-                          </div>
-
-                          <div className="flex items-center justify-between px-2 pt-2">
-                            <div className="flex items-center gap-2">
-                              <History className="w-3 h-3 text-black/20" />
-                              <span className="text-[9px] font-bold uppercase tracking-widest text-black/30">{spikedTranscript.length} Segments Captured</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <Database className="w-3 h-3 text-black/20" />
-                              <span className="text-[9px] font-bold uppercase tracking-widest text-black/30">Stored in IndexedDB</span>
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        <>
-                          <div className="w-16 h-16 bg-red-600 rounded-2xl flex items-center justify-center shadow-xl shadow-red-500/20 rotate-3">
-                            <span className="text-white font-black text-3xl">!</span>
-                          </div>
-                          <div className="space-y-2">
-                            <h3 className="text-[12px] font-black uppercase tracking-[0.1em]">Connect with Spiked</h3>
-                            <p className="text-[10px] text-black/40 font-medium max-w-[200px] mx-auto leading-relaxed">
-                              Securely bridge your meeting intelligence and transfer transcripts for cognitive analysis.
-                            </p>
-                          </div>
-                          <div className="space-y-4 w-full max-w-sm mx-auto">
-                            <div className="space-y-2">
-                              <label className="text-[9px] font-bold uppercase tracking-widest text-black/40 block text-left ml-1">Meeting URL (Google Meet, Zoom, Teams)</label>
-                              <input 
-                                type="text"
-                                value={recallMeetingUrl}
-                                onChange={(e) => setRecallMeetingUrl(e.target.value)}
-                                placeholder="https://meet.google.com/abc-defg-hij"
-                                className="w-full bg-white border border-black/10 rounded-xl px-4 py-3 text-xs focus:outline-none focus:ring-2 focus:ring-black/5 transition-all shadow-sm"
-                              />
-                            </div>
-                            <div className="flex flex-col items-center gap-4">
-                              <button 
-                                onClick={loadSpikedTranscript}
-                                disabled={!recallMeetingUrl && spikedConnectionStatus === 'idle'}
-                                className="w-full bg-black text-white px-8 py-3 rounded-xl text-[10px] font-black uppercase tracking-[0.2em] hover:bg-black/90 transition-all shadow-xl shadow-black/10 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                              >
-                                {recallMeetingUrl ? "Join & Sync Meeting" : "Connect & Transfer"}
-                              </button>
-                              {spikedConnectionStatus !== 'idle' && (
-                                <div className="flex items-center gap-2">
-                                  <div className={cn(
-                                    "w-1.5 h-1.5 rounded-full",
-                                    spikedConnectionStatus === 'connecting' && "bg-amber-400 animate-pulse",
-                                    spikedConnectionStatus === 'connected' && "bg-emerald-500",
-                                    spikedConnectionStatus === 'error' && "bg-red-500"
-                                  )} />
-                                  <span className={cn(
-                                    "text-[9px] font-bold uppercase tracking-widest",
-                                    spikedConnectionStatus === 'connecting' && "text-amber-600",
-                                    spikedConnectionStatus === 'connected' && "text-emerald-600",
-                                    spikedConnectionStatus === 'error' && "text-red-600"
-                                  )}>
-                                    {spikedConnectionStatus === 'connecting' && "Connecting..."}
-                                    {spikedConnectionStatus === 'connected' && (recallBotId ? "Bot Joined Meeting" : "Connected")}
-                                    {spikedConnectionStatus === 'error' && "Error: Connection Failed"}
-                                  </span>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                    {spikedTranscript.length > 0 && (
+                  <div className="space-y-8">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                       <div className="space-y-4">
-                        <div className="flex items-center justify-between px-1">
-                          <label className="text-[9px] font-bold uppercase tracking-widest text-black/40">Synchronized Transcript</label>
-                          <span className="text-[8px] font-bold uppercase tracking-widest text-emerald-500 flex items-center gap-1">
-                            <Activity className="w-2 h-2" /> Live Link Active
-                          </span>
-                        </div>
-                        <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-                          {groupTranscriptBySpeaker(spikedTranscript).map((group) => (
-                            <div key={group.id} className="flex items-start gap-3 p-4 bg-white border border-black/5 rounded-2xl shadow-sm">
-                              <div className="w-8 h-8 bg-black/5 rounded-full flex items-center justify-center shrink-0">
-                                <span className="text-[10px] font-black">{group.speaker?.charAt(0) || '?'}</span>
-                              </div>
-                              <div className="space-y-1">
-                                <p className="text-[10px] font-black uppercase tracking-tight text-black/40">{group.speaker || 'Unknown'}</p>
-                                <p className="text-[11px] text-black/70 leading-relaxed">{group.text}</p>
-                              </div>
-                            </div>
-                          ))}
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-black/40 px-1">Customer / Stakeholder</label>
+                        <div className="relative group">
+                          <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                            <Users className="w-4 h-4 text-black/20 group-focus-within:text-red-500 transition-colors" />
+                          </div>
+                          <input
+                            type="text"
+                            value={livePerson1}
+                            onChange={(e) => setLivePerson1(e.target.value)}
+                            placeholder="e.g. CTO, VP Ops..."
+                            className="w-full pl-11 pr-4 py-4 bg-white border border-black/5 rounded-2xl text-sm focus:ring-2 focus:ring-red-500/20 focus:border-red-500 outline-none transition-all placeholder:text-black/20"
+                          />
                         </div>
                       </div>
-                    )}
+                      <div className="space-y-4">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-black/40 px-1">Architect / Consultant</label>
+                        <div className="relative group">
+                          <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                            <Shield className="w-4 h-4 text-black/20 group-focus-within:text-red-500 transition-colors" />
+                          </div>
+                          <input
+                            type="text"
+                            value={livePerson2}
+                            onChange={(e) => setLivePerson2(e.target.value)}
+                            placeholder="Your Name..."
+                            className="w-full pl-11 pr-4 py-4 bg-white border border-black/5 rounded-2xl text-sm focus:ring-2 focus:ring-red-500/20 focus:border-red-500 outline-none transition-all placeholder:text-black/20"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                      <div className="lg:col-span-2">
+                        <LiveTranscriptPanel 
+                          transcript={streamTranscript}
+                          isConnected={isConnected}
+                          error={streamError}
+                          className="h-[500px]"
+                        />
+                      </div>
+
+                      <div className="space-y-6">
+                        <div className="bg-black text-white rounded-3xl p-8 space-y-6 shadow-2xl shadow-black/20 relative overflow-hidden group">
+                          <div className="absolute top-0 right-0 p-8 opacity-10 group-hover:scale-110 transition-transform">
+                            <Mic className="w-16 h-16" />
+                          </div>
+                          <div className="relative z-10">
+                            <h3 className="text-lg font-black uppercase tracking-tight mb-2">Voice Capture</h3>
+                            <p className="text-white/60 text-[11px] leading-relaxed mb-6">
+                              Connect to a live meeting stream or use local microphone for real-time requirement gathering.
+                            </p>
+                            
+                            <div className="space-y-3">
+                              <button
+                                onClick={() => setIsRecording(!isRecording)}
+                                className={cn(
+                                  "w-full flex items-center justify-center gap-3 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest transition-all",
+                                  isRecording 
+                                    ? "bg-red-500 text-white shadow-lg shadow-red-500/40" 
+                                    : "bg-white/10 text-white hover:bg-white/20"
+                                )}
+                              >
+                                {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
+                                {isRecording ? "Stop Local Mic" : "Start Local Mic"}
+                              </button>
+
+                              <button
+                                onClick={clearStreamTranscript}
+                                className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest text-white/40 hover:text-white hover:bg-white/5 transition-all"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                                Clear Stream
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="bg-white border border-black/5 rounded-3xl p-6 space-y-4">
+                          <div className="flex items-center gap-2 text-black/40 mb-2">
+                            <Target className="w-4 h-4" />
+                            <span className="text-[10px] font-bold uppercase tracking-widest">Meeting ID</span>
+                          </div>
+                          <input
+                            type="text"
+                            value={botId || ''}
+                            onChange={(e) => setBotId(e.target.value)}
+                            placeholder="Enter Bot ID..."
+                            className="w-full px-4 py-3 bg-black/5 border-none rounded-xl text-xs font-mono focus:ring-2 focus:ring-black/5 outline-none transition-all"
+                          />
+                          <p className="text-[9px] text-black/30 leading-relaxed">
+                            Enter the Recall.ai Bot ID to stream live meeting transcripts directly into the architect engine.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                )}
-              </section>
+                )
+              }
+            </section>
             </div>
 
             <div className="max-w-xl mx-auto pt-8">
               <button
                 onClick={handleAnalyze}
-                disabled={isAnalyzing || isOcrLoading || (inputMode === 'paste' ? !transcript.trim() : inputMode === 'spiked' ? spikedTranscript.length === 0 : (!livePerson1.trim() && !livePerson2.trim()))}
+                disabled={
+                  isAnalyzing || 
+                  isOcrLoading || 
+                  (inputMode === 'paste' && !transcript.trim()) ||
+                  (inputMode === 'live' && !livePerson1.trim() && !livePerson2.trim()) ||
+                  (inputMode === 'upload' && !transcript.trim())
+                }
                 className={cn(
                   "w-full flex items-center justify-center gap-3 px-8 py-6 rounded-2xl font-black uppercase tracking-[0.2em] text-sm transition-all shadow-2xl",
                   isAnalyzing ? "bg-black/10 text-black/40 cursor-not-allowed" : "bg-red-600 text-white hover:bg-red-700 active:scale-95 shadow-red-600/20"

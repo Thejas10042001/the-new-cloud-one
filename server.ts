@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Initialize SQLite Database
-const db = new Database("spikedai.db");
+const db = new Database("history.db");
 db.exec(`
   CREATE TABLE IF NOT EXISTS history (
     id TEXT PRIMARY KEY,
@@ -65,70 +65,6 @@ async function startServer() {
     }
   });
 
-  // Recall.ai API Proxy Routes
-  const RECALL_API_KEY = process.env.RECALL_AI_API_KEY;
-  const RECALL_BASE_URL = "https://api.recall.ai/api/v1";
-
-  app.post("/api/recall/bot", async (req, res) => {
-    try {
-      const { meeting_url, bot_name } = req.body;
-      if (!RECALL_API_KEY) {
-        return res.status(500).json({ error: "RECALL_AI_API_KEY not configured" });
-      }
-
-      const response = await fetch(`${RECALL_BASE_URL}/bot`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Token ${RECALL_API_KEY}`,
-        },
-        body: JSON.stringify({
-          meeting_url,
-          bot_name: bot_name || "Spiked AI Architect",
-          transcription_options: {
-            provider: "assemblyai",
-          },
-        }),
-      });
-
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } catch (error) {
-      console.error("Recall API Error:", error);
-      res.status(500).json({ error: "Failed to create Recall bot" });
-    }
-  });
-
-  app.get("/api/recall/bot/:id", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const response = await fetch(`${RECALL_BASE_URL}/bot/${id}`, {
-        headers: {
-          Authorization: `Token ${RECALL_API_KEY}`,
-        },
-      });
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch bot status" });
-    }
-  });
-
-  app.get("/api/recall/bot/:id/transcript", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const response = await fetch(`${RECALL_BASE_URL}/bot/${id}/transcript`, {
-        headers: {
-          Authorization: `Token ${RECALL_API_KEY}`,
-        },
-      });
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch transcript" });
-    }
-  });
-
   // Real-Time Transcript SSE Endpoint
   app.get("/api/transcripts/:botId", (req, res) => {
     const { botId } = req.params;
@@ -140,8 +76,6 @@ async function startServer() {
 
     console.log(`SSE Client connected for bot: ${botId}`);
 
-    // Mock transcript generation for demonstration
-    // In a real app, this would be triggered by Recall.ai webhooks
     let segmentId = 1;
     const speakers = ["Architect", "CTO", "VP Ops", "Security Lead"];
     const phrases = [
@@ -170,7 +104,7 @@ async function startServer() {
 
       res.write(`data: ${JSON.stringify(segment)}\n\n`);
 
-      // Reset simulation
+      // Reset simulation for demo purposes
       if (segmentId > 50) segmentId = 1;
     }, 3000);
 
