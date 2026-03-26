@@ -20,8 +20,11 @@ class TranscriptStreamService {
 
     this.abortController = new AbortController();
 
+    const url = `/api/transcripts/${encodeURIComponent(botId)}`;
+    console.log(`Connecting to transcript stream: ${url}`);
+
     try {
-      await fetchEventSource(`/api/transcripts/${botId}`, {
+      await fetchEventSource(url, {
         method: 'GET',
         headers: {
           'Accept': 'text/event-stream',
@@ -31,17 +34,35 @@ class TranscriptStreamService {
           if (response.ok && response.headers.get('content-type')?.includes('text/event-stream')) {
             onConnectionChange?.(true);
           } else {
+            const body = await response.text();
+            console.error(`Connection failed: ${response.status} ${response.statusText} - Body: ${body}`);
             throw new Error(`Failed to connect: ${response.status} ${response.statusText}`);
           }
         },
         onmessage: (msg) => {
+          if (!msg.data || !msg.data.trim()) return;
+          
           if (msg.event === 'transcript' || !msg.event) {
             try {
               const segment: TranscriptSegment = JSON.parse(msg.data);
               onTranscript(segment);
             } catch (e) {
-              console.error('Failed to parse transcript segment', e);
-              onError?.(e);
+              console.error('Failed to parse transcript segment', e, 'Data:', msg.data);
+            }
+          } else if (msg.event === 'status') {
+            try {
+              const status = JSON.parse(msg.data);
+              console.log('Transcript stream status:', status.message);
+            } catch (e) {
+              console.error('Failed to parse status message', e);
+            }
+          } else if (msg.event === 'error') {
+            try {
+              const error = JSON.parse(msg.data);
+              console.error('Transcript stream error event:', error.message);
+              onError?.(new Error(error.message));
+            } catch (e) {
+              console.error('Failed to parse error message', e);
             }
           }
         },
@@ -50,6 +71,12 @@ class TranscriptStreamService {
           console.log('Transcript stream closed');
         },
         onerror: (err) => {
+          // Ignore abort errors as they are intentional during disconnects/reconnects
+          const isAbort = err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted'));
+          if (isAbort) {
+            return;
+          }
+          
           onConnectionChange?.(false);
           console.error('Transcript stream error', err);
           onError?.(err);

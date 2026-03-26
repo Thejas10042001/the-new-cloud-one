@@ -18,7 +18,11 @@ db.exec(`
     timestamp INTEGER,
     transcript TEXT,
     result TEXT
-  )
+  );
+  CREATE TABLE IF NOT EXISTS transcripts (
+    bot_id TEXT PRIMARY KEY,
+    transcript TEXT
+  );
 `);
 
 async function startServer() {
@@ -65,54 +69,185 @@ async function startServer() {
     }
   });
 
-  // Real-Time Transcript SSE Endpoint
-  app.get("/api/transcripts/:botId", (req, res) => {
-    const { botId } = req.params;
+  // Recall.ai API Routes
+  app.post("/api/recall/join", async (req, res) => {
+    try {
+      const { meeting_url, bot_name } = req.body;
+      const apiKey = process.env.RECALL_AI_API_KEY;
+      const region = process.env.RECALL_AI_REGION || "us-west-2";
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders();
+      if (!apiKey) {
+        return res.status(500).json({ error: "Recall.ai API Key not configured. Please set RECALL_AI_API_KEY in your environment variables." });
+      }
 
-    console.log(`SSE Client connected for bot: ${botId}`);
+      console.log(`Attempting to join meeting with Recall.ai bot. Region: ${region}`);
 
-    let segmentId = 1;
-    const speakers = ["Architect", "CTO", "VP Ops", "Security Lead"];
-    const phrases = [
-      "We need to consider the latency requirements for the new API.",
-      "The current database is struggling with the analytical load.",
-      "Security is our top priority for this modernization.",
-      "What is the estimated timeline for the pilot phase?",
-      "We should look into AWS Lambda for the processing layer.",
-      "The budget for OpEx is strictly capped at $20k.",
-      "How are we handling data residency for GDPR compliance?",
-      "The legacy system has too much technical debt.",
-      "We need a robust CI/CD pipeline for the new microservices.",
-      "Zero Trust architecture is the way forward."
-    ];
+      const response = await fetch(`https://${region}.recall.ai/api/v1/bot/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Token ${apiKey}`,
+        },
+        body: JSON.stringify({
+          meeting_url,
+          bot_name: bot_name || "Meeting Bot",
+          webhook_url: process.env.WEBHOOK_SERVER_URL || `${process.env.APP_URL}/webhook/recall/transcript`
+        }),
+      });
 
-    const interval = setInterval(() => {
-      const segment = {
-        id: segmentId++,
-        speaker: speakers[Math.floor(Math.random() * speakers.length)],
-        text: phrases[Math.floor(Math.random() * phrases.length)],
-        start: segmentId * 5,
-        end: segmentId * 5 + 4,
-        language: "en",
-        created_at: new Date().toISOString()
-      };
+      const text = await response.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (e) {
+        console.error("Failed to parse Recall.ai response:", text);
+        throw new Error(`Invalid response from Recall.ai (Status ${response.status}): ${text.substring(0, 100)}`);
+      }
 
-      res.write(`data: ${JSON.stringify(segment)}\n\n`);
+      if (!response.ok) {
+        console.error("Recall.ai API Error:", {
+          status: response.status,
+          statusText: response.statusText,
+          data
+        });
+        throw new Error(data.error || data.message || `Recall.ai API returned ${response.status}: ${response.statusText}`);
+      }
 
-      // Reset simulation for demo purposes
-      if (segmentId > 50) segmentId = 1;
-    }, 3000);
+      res.json(data);
+    } catch (error: any) {
+      console.error("Recall.ai Join Error:", error);
+      res.status(500).json({ error: error.message || "Failed to join meeting" });
+    }
+  });
 
-    req.on("close", () => {
-      clearInterval(interval);
-      console.log(`SSE Client disconnected for bot: ${botId}`);
-      res.end();
-    });
+  app.get("/api/recall/bot/:botId", async (req, res) => {
+    try {
+      const { botId } = req.params;
+      
+      // First check our local database for transcripts received via webhook
+      const stmt = db.prepare("SELECT transcript FROM transcripts WHERE bot_id = ?");
+      const row = stmt.get(botId) as { transcript: string } | undefined;
+      
+      if (row) {
+        return res.json({ transcript: JSON.parse(row.transcript), status: 'recording' });
+      }
+
+      // If not in DB, try to fetch from Recall.ai directly
+      const apiKey = process.env.RECALL_AI_API_KEY;
+      const region = process.env.RECALL_AI_REGION || "us-west-2";
+
+      if (!apiKey) {
+        return res.status(500).json({ error: "Recall.ai API Key not configured." });
+      }
+
+      // Fetch bot details for status
+      const botResponse = await fetch(`https://${region}.recall.ai/api/v1/bot/${botId}/`, {
+        method: "GET",
+        headers: {
+          "Authorization": `Token ${apiKey}`,
+        },
+      });
+      
+      if (!botResponse.ok) {
+        const text = await botResponse.text();
+        throw new Error(`Recall.ai API returned ${botResponse.status}: ${text.substring(0, 100)}`);
+      }
+      const botData = await botResponse.json();
+
+      // Fetch transcript
+      const transcriptResponse = await fetch(`https://${region}.recall.ai/api/v1/bot/${botId}/transcript/`, {
+        method: "GET",
+        headers: {
+          "Authorization": `Token ${apiKey}`,
+        },
+      });
+      
+      let transcriptData = [];
+      if (transcriptResponse.ok) {
+        transcriptData = await transcriptResponse.json();
+      }
+
+      res.json({ 
+        transcript: transcriptData, 
+        status: botData.status_code || botData.status?.code || 'recording' 
+      });
+    } catch (error: any) {
+      console.error("Recall.ai Fetch Error:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch bot details" });
+    }
+  });
+
+  // Webhook handler for Recall.ai
+  app.post("/webhook/recall/transcript", (req, res) => {
+    try {
+      console.log("Webhook received:", JSON.stringify(req.body, null, 2));
+      const { event, data } = req.body;
+      
+      // Support all Recall.ai webhook event name variants
+      const isTranscriptEvent = [
+        'bot.transcript',
+        'bot.transcription_completed',
+        'bot.transcription.data',
+        'bot.transcription.done',
+        'transcript',
+      ].includes(event);
+
+      if (isTranscriptEvent) {
+        const botId = data?.bot_id || data?.data?.bot_id;
+        // Recall.ai v2 sends segments under data.data.transcript or data.transcript
+        const rawTranscript = data?.transcript ?? data?.data?.transcript ?? null;
+        const newTranscript = rawTranscript;
+        
+        if (botId && newTranscript) {
+          // Fetch existing transcript
+          const stmtSelect = db.prepare("SELECT transcript FROM transcripts WHERE bot_id = ?");
+          const row = stmtSelect.get(botId) as { transcript: string } | undefined;
+          
+          let transcriptList = [];
+          if (row) {
+            try {
+              transcriptList = JSON.parse(row.transcript);
+              if (!Array.isArray(transcriptList)) {
+                transcriptList = [transcriptList];
+              }
+            } catch (e) {
+              transcriptList = [];
+            }
+          }
+          
+          // Normalize segments: Recall.ai v2 uses { speaker, words: [{text,start_time,end_time}] }
+          // Flatten to { speaker, text, start_time } for our frontend
+          const normalize = (seg: any) => {
+            if (typeof seg === 'string') return { speaker: 'Unknown', text: seg, start_time: null };
+            if (seg.words && Array.isArray(seg.words)) {
+              return {
+                speaker: seg.speaker || 'Unknown',
+                text: seg.words.map((w: any) => w.text || w.word || '').join(' ').trim(),
+                start_time: seg.words[0]?.start_time ?? seg.start_time ?? null,
+              };
+            }
+            return { speaker: seg.speaker || 'Unknown', text: seg.text || '', start_time: seg.start_time || null };
+          };
+
+          // Append new transcript (if it's an array, append all, otherwise append single)
+          if (Array.isArray(newTranscript)) {
+            transcriptList = [...transcriptList, ...newTranscript.map(normalize)];
+          } else {
+            transcriptList.push(normalize(newTranscript));
+          }
+          
+          // Store updated transcript
+          const stmtUpdate = db.prepare("INSERT OR REPLACE INTO transcripts (bot_id, transcript) VALUES (?, ?)");
+          stmtUpdate.run(botId, JSON.stringify(transcriptList));
+          console.log(`Updated transcript for bot ${botId} (Total segments: ${transcriptList.length})`);
+        }
+      }
+      
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("Webhook Error:", error);
+      res.status(500).send("Error");
+    }
   });
 
   // Vite middleware for development

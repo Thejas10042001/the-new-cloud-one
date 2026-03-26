@@ -292,6 +292,44 @@ Return a JSON object with "speaker": 1 or 2.`,
   }
 }
 
+export async function detectAccent(text: string): Promise<string> {
+  const response = await ai.models.generateContent({
+    model: "gemini-3-flash-preview",
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `Analyze the following text and detect the most likely accent of the speaker. 
+            Consider word choice, phrasing, and common linguistic patterns.
+            
+            Text: "${text}"
+            
+            Return a JSON object with a single field "accent" (e.g., "American", "British", "Indian", "Australian", "Neutral", etc.).`,
+          },
+        ],
+      },
+    ],
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          accent: { type: Type.STRING },
+        },
+        required: ["accent"],
+      },
+    },
+  });
+
+  try {
+    const result = JSON.parse(response.text || '{"accent": "Neutral"}');
+    return result.accent || "Neutral";
+  } catch (e) {
+    return "Neutral";
+  }
+}
+
 export async function analyzeTranscript(transcript: string, documentContext?: string) {
   const contextPrompt = documentContext 
     ? `Additional Document Context:

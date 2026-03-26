@@ -37,15 +37,13 @@ import {
   Upload,
   Loader2,
   DollarSign,
-  Activity
+  Activity,
+  MessageSquare
 } from 'lucide-react';
-import { analyzeTranscript, performOCR, validateDocumentMatch, diarizeSpeaker } from './services/geminiService';
+import { analyzeTranscript, performOCR, validateDocumentMatch, diarizeSpeaker, detectAccent } from './services/geminiService';
 import { cn } from './lib/utils';
 import mammoth from 'mammoth';
 import mermaid from 'mermaid';
-import { useTranscriptStream } from './hooks/useTranscriptStream';
-import { LiveTranscriptPanel } from './components/LiveTranscriptPanel';
-import { TranscriptSegment } from './types/transcriptTypes';
 import { 
   BarChart, 
   Bar, 
@@ -293,9 +291,16 @@ Financial Constraints:
 
 export default function App() {
   const [transcript, setTranscript] = useState('');
+  const [transcriptSegments, setTranscriptSegments] = useState<{ speaker: string, text: string, timestamp: string }[]>([]);
+  const [speakerAccents, setSpeakerAccents] = useState<Record<string, string>>({});
   const [documentText, setDocumentText] = useState('');
   const [documentName, setDocumentName] = useState('');
-  const [inputMode, setInputMode] = useState<'paste' | 'live' | 'upload'>('paste');
+  const [inputMode, setInputMode] = useState<'paste' | 'live' | 'upload' | 'bot'>('paste');
+  const [meetingUrl, setMeetingUrl] = useState('');
+  const [botId, setBotId] = useState<string | null>(null);
+  const [isBotJoining, setIsBotJoining] = useState(false);
+  const [botStatus, setBotStatus] = useState<string>('joining');
+  const [isFetchingTranscript, setIsFetchingTranscript] = useState(false);
   const [livePerson1, setLivePerson1] = useState('');
   const [livePerson2, setLivePerson2] = useState('');
   const [person1VoiceSample, setPerson1VoiceSample] = useState<string | null>(null);
@@ -345,17 +350,6 @@ export default function App() {
   const [loadingMessage, setLoadingMessage] = useState('');
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
 
-  const [botId, setBotId] = useState<string | null>('demo-bot');
-
-  // Live Transcript Stream Hook
-  const { 
-    transcript: streamTranscript, 
-    isConnected, 
-    error: streamError, 
-    getLiveTranscriptContext,
-    clearTranscript: clearStreamTranscript
-  } = useTranscriptStream(botId);
-
   useEffect(() => {
     let recognition: any = null;
     let shouldRestart = true;
@@ -378,6 +372,8 @@ export default function App() {
           
           if (finalTranscript) {
             let targetSpeaker = activeSpeakerRef.current;
+            const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const speakerName = targetSpeaker === 1 ? 'Customer' : 'Architect';
             
             if (isAutoDiarizationEnabledRef.current) {
               // Smart Diarization: Guess speaker based on content
@@ -385,11 +381,26 @@ export default function App() {
               setActiveSpeaker(targetSpeaker);
             }
 
+            setTranscriptSegments(prev => [...prev, { 
+              speaker: speakerName, 
+              text: finalTranscript.trim(), 
+              timestamp 
+            }]);
+
+            // Detect accent for the speaker if not already detected
+            if (!speakerAccents[speakerName]) {
+              detectAccent(finalTranscript.trim()).then(accent => {
+                setSpeakerAccents(prev => ({ ...prev, [speakerName]: accent }));
+              });
+            }
+
             if (targetSpeaker === 1) {
               setLivePerson1(prev => prev + (prev ? ' ' : '') + finalTranscript.trim());
             } else {
               setLivePerson2(prev => prev + (prev ? ' ' : '') + finalTranscript.trim());
             }
+            
+            setTranscript(prev => prev + (prev ? '\n' : '') + `${speakerName}: ${finalTranscript.trim()}`);
           }
         };
         
@@ -553,13 +564,112 @@ export default function App() {
     }
   };
 
+  const handleJoinBot = async () => {
+    if (!meetingUrl) return;
+    setIsBotJoining(true);
+    setError(null);
+    try {
+      const response = await fetch('/api/recall/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meeting_url: meetingUrl, bot_name: 'SpikedAI Assistant' })
+      });
+      
+      const text = await response.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (e) {
+        throw new Error(`Server returned invalid response: ${text.substring(0, 100)}`);
+      }
+
+      if (data.id) {
+        setBotId(data.id);
+        // Start polling for transcript
+        pollTranscript(data.id);
+      } else {
+        throw new Error(data.error || 'Failed to join bot');
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'Failed to join bot');
+    } finally {
+      setIsBotJoining(false);
+    }
+  };
+
+  const pollTranscript = async (id: string) => {
+    setIsFetchingTranscript(true);
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/recall/bot/${id}`);
+        const text = await response.text();
+        let data;
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch (e) {
+          console.error('Failed to parse poll response:', text);
+          return;
+        }
+        
+        if (data.status) {
+          setBotStatus(data.status);
+        }
+
+        // Recall.ai transcript: segments may use { speaker, text } or v2 { speaker, words:[{text,start_time}] }
+        if (data.transcript) {
+          const rawSegments = (Array.isArray(data.transcript) ? data.transcript : [data.transcript]);
+          // Normalize each segment regardless of Recall.ai version
+          const normalize = (s: any) => {
+            if (!s) return null;
+            let text = s.text || '';
+            let startTime = s.start_time || null;
+            if (!text && s.words && Array.isArray(s.words)) {
+              text = s.words.map((w: any) => w.text || w.word || '').join(' ').trim();
+              startTime = s.words[0]?.start_time ?? null;
+            }
+            if (!text) return null;
+            return {
+              speaker: s.speaker || 'Unknown',
+              text,
+              timestamp: startTime
+                ? new Date(startTime * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+            };
+          };
+          const segments = rawSegments.map(normalize).filter(Boolean) as { speaker: string, text: string, timestamp: string }[];
+          if (segments.length > 0) {
+            setTranscriptSegments(segments);
+            const fullTranscript = segments.map(s => `${s.speaker}: ${s.text}`).join('\n');
+            setTranscript(fullTranscript);
+
+            // Detect accents for new speakers
+            segments.forEach(async (s) => {
+              if (!speakerAccents[s.speaker]) {
+                const accent = await detectAccent(s.text);
+                setSpeakerAccents(prev => ({ ...prev, [s.speaker]: accent }));
+              }
+            });
+          }
+        }
+
+        if (data.status === 'done' || data.status === 'fatal' || data.status === 'completed') {
+          clearInterval(interval);
+          setIsFetchingTranscript(false);
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
+      }
+    }, 5000); // Poll every 5 seconds
+  };
+
   const handleAnalyze = async () => {
     let finalTranscript = '';
     
-    if (inputMode === 'paste' || inputMode === 'upload') {
+    if (inputMode === 'paste' || inputMode === 'upload' || inputMode === 'bot') {
       finalTranscript = transcript;
     } else if (inputMode === 'live') {
-      finalTranscript = getLiveTranscriptContext() || `Customer: ${livePerson1}\nArchitect: ${livePerson2}`;
+      finalTranscript = `Customer: ${livePerson1}\nArchitect: ${livePerson2}`;
     }
 
     if (!finalTranscript.trim()) return;
@@ -772,6 +882,12 @@ export default function App() {
                     >
                       Live
                     </button>
+                    <button 
+                      onClick={() => setInputMode('bot')}
+                      className={cn("px-3 py-1 rounded-md text-[9px] font-bold uppercase tracking-widest transition-all", inputMode === 'bot' ? "bg-white shadow-sm text-black" : "text-black/40")}
+                    >
+                      Bot
+                    </button>
                   </div>
                   <button onClick={loadSample} className="text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black">Sample</button>
                 </div>
@@ -847,109 +963,355 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                ) : (
-                  <div className="space-y-8">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      <div className="space-y-4">
-                        <label className="text-[10px] font-bold uppercase tracking-widest text-black/40 px-1">Customer / Stakeholder</label>
-                        <div className="relative group">
-                          <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                            <Users className="w-4 h-4 text-black/20 group-focus-within:text-red-500 transition-colors" />
-                          </div>
-                          <input
-                            type="text"
-                            value={livePerson1}
-                            onChange={(e) => setLivePerson1(e.target.value)}
-                            placeholder="e.g. CTO, VP Ops..."
-                            className="w-full pl-11 pr-4 py-4 bg-white border border-black/5 rounded-2xl text-sm focus:ring-2 focus:ring-red-500/20 focus:border-red-500 outline-none transition-all placeholder:text-black/20"
-                          />
+                ) : inputMode === 'bot' ? (
+                  <div className="flex flex-col gap-6">
+                    <div className="bg-black/5 rounded-2xl p-6 space-y-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-black rounded-full flex items-center justify-center">
+                          <Rocket className="w-5 h-5 text-white" />
+                        </div>
+                        <div className="space-y-0.5">
+                          <p className="text-[11px] font-black uppercase tracking-widest">Recall.ai Bot</p>
+                          <p className="text-[9px] text-black/40 font-bold uppercase tracking-widest">Autonomous Meeting Intelligence</p>
                         </div>
                       </div>
-                      <div className="space-y-4">
-                        <label className="text-[10px] font-bold uppercase tracking-widest text-black/40 px-1">Architect / Consultant</label>
-                        <div className="relative group">
-                          <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                            <Shield className="w-4 h-4 text-black/20 group-focus-within:text-red-500 transition-colors" />
-                          </div>
-                          <input
+                      
+                      <div className="space-y-2">
+                        <label className="text-[9px] font-bold uppercase tracking-widest text-black/40 ml-1">Meeting URL (Zoom, Google Meet, Teams)</label>
+                        <div className="flex gap-2">
+                          <input 
                             type="text"
-                            value={livePerson2}
-                            onChange={(e) => setLivePerson2(e.target.value)}
-                            placeholder="Your Name..."
-                            className="w-full pl-11 pr-4 py-4 bg-white border border-black/5 rounded-2xl text-sm focus:ring-2 focus:ring-red-500/20 focus:border-red-500 outline-none transition-all placeholder:text-black/20"
+                            value={meetingUrl}
+                            onChange={(e) => setMeetingUrl(e.target.value)}
+                            placeholder="https://zoom.us/j/..."
+                            className="flex-1 bg-white border border-black/10 rounded-xl px-4 py-3 text-xs focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
                           />
+                          <button 
+                            onClick={handleJoinBot}
+                            disabled={isBotJoining || !meetingUrl}
+                            className={cn(
+                              "px-6 py-3 rounded-xl text-[10px] font-black uppercase tracking-[0.15em] transition-all flex items-center gap-2",
+                              isBotJoining || !meetingUrl
+                                ? "bg-black/5 text-black/20 cursor-not-allowed"
+                                : "bg-black text-white hover:bg-black/90 shadow-lg shadow-black/10 active:scale-95"
+                            )}
+                          >
+                            {isBotJoining ? (
+                              <>
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                                Joining...
+                              </>
+                            ) : (
+                              <>
+                                <Play className="w-3 h-3" />
+                                Join Bot
+                              </>
+                            )}
+                          </button>
                         </div>
+                      </div>
+
+                      {botId && (
+                        <div className={cn(
+                          "flex items-center gap-3 p-3 rounded-xl border transition-all",
+                          botStatus === 'recording' ? "bg-emerald-50 border-emerald-100" : "bg-blue-50 border-blue-100"
+                        )}>
+                          <div className={cn(
+                            "w-2 h-2 rounded-full animate-pulse",
+                            botStatus === 'recording' ? "bg-emerald-500" : "bg-blue-500"
+                          )} />
+                          <div className="flex-1">
+                            <p className={cn(
+                              "text-[9px] font-bold uppercase tracking-widest",
+                              botStatus === 'recording' ? "text-emerald-800" : "text-blue-800"
+                            )}>
+                              Bot {botStatus.replace('_', ' ')}
+                            </p>
+                            <p className={cn(
+                              "text-[8px] font-medium",
+                              botStatus === 'recording' ? "text-emerald-600" : "text-blue-600"
+                            )}>ID: {botId}</p>
+                          </div>
+                          {isFetchingTranscript && (
+                            <div className="flex items-center gap-2">
+                              <Loader2 className="w-3 h-3 animate-spin text-emerald-600" />
+                              <span className="text-[8px] font-bold text-emerald-600 uppercase tracking-widest">Live Feed</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="bg-black/5 rounded-2xl p-6 space-y-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-black rounded-full flex items-center justify-center">
+                          <MessageSquare className="w-5 h-5 text-white" />
+                        </div>
+                        <div className="space-y-0.5">
+                          <p className="text-[11px] font-black uppercase tracking-widest">Bot Meeting Transcripts</p>
+                          <p className="text-[9px] text-black/40 font-bold uppercase tracking-widest">Live Conversation Feed</p>
+                        </div>
+                      </div>
+
+                      <div className="w-full h-[300px] bg-white border border-black/10 rounded-xl p-4 overflow-y-auto custom-scrollbar space-y-4 shadow-sm">
+                        {transcriptSegments.length > 0 ? (
+                          transcriptSegments.map((segment, index) => (
+                            <div key={index} className={cn(
+                              "p-3 rounded-xl transition-all border",
+                              isFetchingTranscript && index === transcriptSegments.length - 1
+                                ? "bg-red-50 border-red-100 shadow-sm" 
+                                : "bg-black/[0.02] border-transparent"
+                            )}>
+                              <div className="flex items-center justify-between mb-1">
+                                <div className="flex items-center gap-2">
+                                  <span className={cn(
+                                    "text-[8px] font-black uppercase tracking-widest",
+                                    segment.speaker === 'Architect' ? "text-red-600" : "text-black"
+                                  )}>
+                                    {segment.speaker}
+                                  </span>
+                                  {speakerAccents[segment.speaker] && (
+                                    <span className="text-[7px] font-bold text-black/30 uppercase tracking-tighter">
+                                      ({speakerAccents[segment.speaker]} Accent)
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-[7px] font-mono text-black/20 group-hover:text-black/40 transition-colors">
+                                  {segment.timestamp}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-black/70 leading-relaxed font-medium">
+                                {segment.text}
+                              </p>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="h-full flex flex-col items-center justify-center text-center space-y-2 opacity-20">
+                            {botId ? (
+                              <>
+                                <Loader2 className="w-6 h-6 animate-spin" />
+                                <p className="text-[10px] font-bold uppercase tracking-widest">Waiting for transcript...</p>
+                                <p className="text-[9px] font-medium">Bot is in the meeting — transcript will appear here</p>
+                              </>
+                            ) : (
+                              <>
+                                <MessageSquare className="w-6 h-6" />
+                                <p className="text-[10px] font-bold uppercase tracking-widest">Join a meeting to start</p>
+                                <p className="text-[9px] font-medium">Enter a meeting URL above and click Join Bot</p>
+                              </>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                      <div className="lg:col-span-2">
-                        <LiveTranscriptPanel 
-                          transcript={streamTranscript}
-                          isConnected={isConnected}
-                          error={streamError}
-                          className="h-[500px]"
-                        />
-                      </div>
-
-                      <div className="space-y-6">
-                        <div className="bg-black text-white rounded-3xl p-8 space-y-6 shadow-2xl shadow-black/20 relative overflow-hidden group">
-                          <div className="absolute top-0 right-0 p-8 opacity-10 group-hover:scale-110 transition-transform">
-                            <Mic className="w-16 h-16" />
-                          </div>
-                          <div className="relative z-10">
-                            <h3 className="text-lg font-black uppercase tracking-tight mb-2">Voice Capture</h3>
-                            <p className="text-white/60 text-[11px] leading-relaxed mb-6">
-                              Connect to a live meeting stream or use local microphone for real-time requirement gathering.
-                            </p>
-                            
-                            <div className="space-y-3">
-                              <button
-                                onClick={() => setIsRecording(!isRecording)}
-                                className={cn(
-                                  "w-full flex items-center justify-center gap-3 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest transition-all",
-                                  isRecording 
-                                    ? "bg-red-500 text-white shadow-lg shadow-red-500/40" 
-                                    : "bg-white/10 text-white hover:bg-white/20"
-                                )}
+                    <div className="space-y-6">
+                      {transcriptSegments.length > 0 && (
+                        <div className="space-y-4">
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between ml-1">
+                              <label className="text-[9px] font-bold uppercase tracking-widest text-black/40">Full Meeting Transcript</label>
+                              <button 
+                                onClick={() => {
+                                  const text = transcriptSegments.map(s => `[${s.timestamp}] ${s.speaker}${speakerAccents[s.speaker] ? ` (${speakerAccents[s.speaker]} Accent)` : ''}: ${s.text}`).join('\n');
+                                  navigator.clipboard.writeText(text);
+                                }}
+                                className="text-[8px] font-bold text-black/40 hover:text-black uppercase tracking-widest transition-colors"
                               >
-                                {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-                                {isRecording ? "Stop Local Mic" : "Start Local Mic"}
-                              </button>
-
-                              <button
-                                onClick={clearStreamTranscript}
-                                className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest text-white/40 hover:text-white hover:bg-white/5 transition-all"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                                Clear Stream
+                                Copy Text
                               </button>
                             </div>
+                            <textarea
+                              readOnly
+                              value={transcriptSegments.map(s => `[${s.timestamp}] ${s.speaker}${speakerAccents[s.speaker] ? ` (${speakerAccents[s.speaker]} Accent)` : ''}: ${s.text}`).join('\n')}
+                              className="w-full h-[150px] bg-black/[0.02] border border-black/10 rounded-2xl p-4 text-[11px] text-black/70 font-mono leading-relaxed resize-none focus:outline-none custom-scrollbar shadow-inner"
+                              placeholder="Full transcript will appear here..."
+                            />
                           </div>
                         </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {transcriptSegments.length > 0 && (
+                      <div className="space-y-2">
+                        <label className="text-[9px] font-bold uppercase tracking-widest text-black/40 ml-1">Live Conversation Stream</label>
+                        <div className="w-full h-[250px] bg-white border border-black/10 rounded-2xl p-4 overflow-y-auto custom-scrollbar space-y-4 shadow-sm">
+                          {transcriptSegments.map((segment, index) => (
+                            <div key={index} className={cn(
+                              "p-3 rounded-xl transition-all border",
+                              segment.speaker === (activeSpeaker === 1 ? 'Customer' : 'Architect') && isRecording && index === transcriptSegments.length - 1
+                                ? "bg-red-50 border-red-100 shadow-sm" 
+                                : "bg-black/[0.02] border-transparent"
+                            )}>
+                              <div className="flex items-center justify-between mb-1">
+                                <div className="flex items-center gap-2">
+                                  <span className={cn(
+                                    "text-[8px] font-black uppercase tracking-widest",
+                                    segment.speaker === 'Architect' ? "text-red-600" : "text-black"
+                                  )}>
+                                    {segment.speaker}
+                                  </span>
+                                  {speakerAccents[segment.speaker] && (
+                                    <span className="text-[7px] font-bold text-black/30 uppercase tracking-tighter">
+                                      ({speakerAccents[segment.speaker]} Accent)
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-[7px] font-mono text-black/20">
+                                  {segment.timestamp}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-black/70 leading-relaxed font-medium">
+                                {segment.text}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
-                        <div className="bg-white border border-black/5 rounded-3xl p-6 space-y-4">
-                          <div className="flex items-center gap-2 text-black/40 mb-2">
-                            <Target className="w-4 h-4" />
-                            <span className="text-[10px] font-bold uppercase tracking-widest">Meeting ID</span>
+                    {/* Voice Profiles Section */}
+                    <div className="bg-black/5 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 text-black/40">
+                          <Users className="w-3 h-3" />
+                          <span className="text-[9px] font-bold uppercase tracking-widest">Voice Profiles</span>
+                        </div>
+                        <label className="flex items-center gap-2 cursor-pointer group">
+                          <div className="flex flex-col items-end mr-1">
+                            <span className="text-[8px] font-bold uppercase tracking-widest text-black/40 group-hover:text-black transition-colors">Auto-Detect</span>
+                            <span className="text-[6px] font-bold uppercase tracking-widest text-emerald-500/60">Voice Tone AI</span>
                           </div>
-                          <input
-                            type="text"
-                            value={botId || ''}
-                            onChange={(e) => setBotId(e.target.value)}
-                            placeholder="Enter Bot ID..."
-                            className="w-full px-4 py-3 bg-black/5 border-none rounded-xl text-xs font-mono focus:ring-2 focus:ring-black/5 outline-none transition-all"
-                          />
-                          <p className="text-[9px] text-black/30 leading-relaxed">
-                            Enter the Recall.ai Bot ID to stream live meeting transcripts directly into the architect engine.
-                          </p>
+                          <div 
+                            onClick={() => setIsAutoDiarizationEnabled(!isAutoDiarizationEnabled)}
+                            className={cn(
+                              "w-8 h-4.5 rounded-full transition-all relative",
+                              isAutoDiarizationEnabled ? "bg-emerald-500 shadow-sm shadow-emerald-500/20" : "bg-black/10"
+                            )}
+                          >
+                            <div className={cn(
+                              "absolute top-0.5 w-3.5 h-3.5 bg-white rounded-full transition-all shadow-sm",
+                              isAutoDiarizationEnabled ? "left-4" : "left-0.5"
+                            )} />
+                          </div>
+                        </label>
+                      </div>
+                      
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-2">
+                          <p className="text-[8px] font-bold uppercase tracking-widest text-black/30">Person 1</p>
+                          <label className={cn(
+                            "flex flex-col items-center justify-center p-2 border border-dashed rounded-xl cursor-pointer transition-all",
+                            person1VoiceSample ? "border-emerald-200 bg-emerald-50/30" : "border-black/10 hover:bg-black/5"
+                          )}>
+                            <Volume2 className={cn("w-3 h-3 mb-1", person1VoiceSample ? "text-emerald-500" : "text-black/20")} />
+                            <span className="text-[7px] font-bold uppercase tracking-widest text-black/40">
+                              {person1VoiceSample ? "Sample Loaded" : "Upload Voice"}
+                            </span>
+                            <input 
+                              type="file" 
+                              className="hidden" 
+                              accept="audio/*" 
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                  const reader = new FileReader();
+                                  reader.onload = () => setPerson1VoiceSample(reader.result as string);
+                                  reader.readAsDataURL(file);
+                                }
+                              }} 
+                            />
+                          </label>
+                        </div>
+                        <div className="space-y-2">
+                          <p className="text-[8px] font-bold uppercase tracking-widest text-black/30">Person 2</p>
+                          <label className={cn(
+                            "flex flex-col items-center justify-center p-2 border border-dashed rounded-xl cursor-pointer transition-all",
+                            person2VoiceSample ? "border-emerald-200 bg-emerald-50/30" : "border-black/10 hover:bg-black/5"
+                          )}>
+                            <Volume2 className={cn("w-3 h-3 mb-1", person2VoiceSample ? "text-emerald-500" : "text-black/20")} />
+                            <span className="text-[7px] font-bold uppercase tracking-widest text-black/40">
+                              {person2VoiceSample ? "Sample Loaded" : "Upload Voice"}
+                            </span>
+                            <input 
+                              type="file" 
+                              className="hidden" 
+                              accept="audio/*" 
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                  const reader = new FileReader();
+                                  reader.onload = () => setPerson2VoiceSample(reader.result as string);
+                                  reader.readAsDataURL(file);
+                                }
+                              }} 
+                            />
+                          </label>
                         </div>
                       </div>
                     </div>
+
+                    <div className={cn(
+                      "space-y-2 p-2 rounded-2xl transition-all border border-transparent",
+                      activeSpeaker === 1 && isRecording && "bg-red-50/50 border-red-100 shadow-sm"
+                    )}>
+                      <div className="flex justify-between items-center px-1">
+                        <label className="text-[9px] font-bold uppercase tracking-widest text-black/40">Person 1 (Customer)</label>
+                        {isRecording && (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 rounded-full border border-red-100">
+                            <div className="flex gap-0.5">
+                              <div className="w-0.5 h-2 bg-red-400 animate-[bounce_1s_infinite_0ms]" />
+                              <div className="w-0.5 h-3 bg-red-500 animate-[bounce_1s_infinite_200ms]" />
+                              <div className="w-0.5 h-2 bg-red-400 animate-[bounce_1s_infinite_400ms]" />
+                            </div>
+                            <span className="text-[7px] font-black text-red-600 uppercase tracking-widest">Analyzing Tone</span>
+                          </div>
+                        )}
+                      </div>
+                      <textarea
+                        value={livePerson1}
+                        onChange={(e) => setLivePerson1(e.target.value)}
+                        onFocus={() => setActiveSpeaker(1)}
+                        placeholder="Customer speaking..."
+                        className="w-full h-[140px] bg-white border border-black/10 rounded-2xl p-4 text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-black/5 transition-all resize-none shadow-sm"
+                      />
+                    </div>
+                    <div className={cn(
+                      "space-y-2 p-2 rounded-2xl transition-all border border-transparent",
+                      activeSpeaker === 2 && isRecording && "bg-red-50/50 border-red-100 shadow-sm"
+                    )}>
+                      <div className="flex justify-between items-center px-1">
+                        <label className="text-[9px] font-bold uppercase tracking-widest text-black/40">Person 2 (Architect)</label>
+                        {isRecording && activeSpeaker === 2 && (
+                          <div className="flex items-center gap-1">
+                            <div className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse" />
+                            <span className="text-[8px] font-bold text-red-500 uppercase tracking-widest">Listening</span>
+                          </div>
+                        )}
+                      </div>
+                      <textarea
+                        value={livePerson2}
+                        onChange={(e) => setLivePerson2(e.target.value)}
+                        onFocus={() => setActiveSpeaker(2)}
+                        placeholder="Architect speaking..."
+                        className="w-full h-[140px] bg-white border border-black/10 rounded-2xl p-4 text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-black/5 transition-all resize-none shadow-sm"
+                      />
+                    </div>
+                    <button 
+                      onClick={() => setIsRecording(!isRecording)}
+                      className={cn(
+                        "w-full flex items-center justify-center gap-2 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all border",
+                        isRecording ? "bg-red-600 border-red-700 text-white shadow-lg shadow-red-500/20" : "bg-black/5 border-transparent text-black/40 hover:bg-black/10"
+                      )}
+                    >
+                      {isRecording ? <Square className="w-3 h-3" /> : <Mic className="w-3 h-3" />}
+                      {isRecording ? "Stop Listening" : "Start Real-time Transcription"}
+                    </button>
                   </div>
-                )
-              }
-            </section>
+                )}
+              </section>
             </div>
 
             <div className="max-w-xl mx-auto pt-8">
