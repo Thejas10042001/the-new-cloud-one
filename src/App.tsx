@@ -27,6 +27,7 @@ import {
   Volume2,
   Trash2,
   Clock,
+  Globe,
   ExternalLink,
   ChevronDown,
   ChevronUp,
@@ -38,9 +39,16 @@ import {
   Loader2,
   DollarSign,
   Activity,
-  MessageSquare
+  MessageSquare,
+  RefreshCw,
+  Settings,
+  Download,
+  Monitor,
+  AlertCircle,
+  Info,
+  Bot
 } from 'lucide-react';
-import { analyzeTranscript, performOCR, validateDocumentMatch, diarizeSpeaker, detectAccent } from './services/geminiService';
+import { analyzeTranscript, performOCR, validateDocumentMatch, diarizeSpeaker, detectAccent, assignRoles, transcribeAudio } from './services/geminiService';
 import { cn } from './lib/utils';
 import mammoth from 'mammoth';
 import mermaid from 'mermaid';
@@ -66,21 +74,57 @@ mermaid.initialize({
 const Mermaid = ({ chart }: { chart: string }) => {
   const ref = React.useRef<HTMLDivElement>(null);
   const [error, setError] = useState(false);
+  const [svg, setSvg] = useState<string>('');
 
-  useEffect(() => {
-    if (ref.current && chart) {
-      setError(false);
-      try {
-        ref.current.removeAttribute('data-processed');
-        mermaid.contentLoaded();
-      } catch (e) {
-        console.error('Mermaid error:', e);
-        setError(true);
+  const cleanChart = (text: string) => {
+    if (!text) return '';
+    // Remove markdown code blocks if present
+    let cleaned = text.replace(/```mermaid\n?|```/g, '').trim();
+    
+    // Ensure it starts with a valid Mermaid keyword if not already
+    if (!cleaned.startsWith('graph') && !cleaned.startsWith('classDiagram') && !cleaned.startsWith('sequenceDiagram') && !cleaned.startsWith('stateDiagram') && !cleaned.startsWith('erDiagram') && !cleaned.startsWith('gantt') && !cleaned.startsWith('pie') && !cleaned.startsWith('flowchart')) {
+      // If it looks like it might be a graph but missing the header
+      if (cleaned.includes('-->') || cleaned.includes('---')) {
+        cleaned = 'graph TD\n' + cleaned;
       }
     }
+    return cleaned;
+  };
+
+  useEffect(() => {
+    const renderChart = async () => {
+      if (!chart) return;
+      
+      const cleaned = cleanChart(chart);
+      if (!cleaned) return;
+
+      setError(false);
+      try {
+        const id = `mermaid-${Math.random().toString(36).substr(2, 9)}`;
+        const { svg: renderedSvg } = await mermaid.render(id, cleaned);
+        setSvg(renderedSvg);
+      } catch (e) {
+        console.error('Mermaid render error:', e);
+        setError(true);
+      }
+    };
+
+    renderChart();
   }, [chart]);
 
-  if (error || !chart.includes('graph') && !chart.includes('classDiagram') && !chart.includes('sequenceDiagram')) {
+  const isMermaid = (text: string) => {
+    const cleaned = cleanChart(text);
+    return cleaned.startsWith('graph') || 
+           cleaned.startsWith('classDiagram') || 
+           cleaned.startsWith('sequenceDiagram') || 
+           cleaned.startsWith('stateDiagram') || 
+           cleaned.startsWith('erDiagram') || 
+           cleaned.startsWith('gantt') || 
+           cleaned.startsWith('pie') || 
+           cleaned.startsWith('flowchart');
+  };
+
+  if (error || !isMermaid(chart)) {
     return (
       <div className="p-6 bg-black rounded-2xl overflow-x-auto custom-scrollbar relative group">
         <pre className="text-[9px] font-mono text-emerald-400 leading-[1.1] whitespace-pre">
@@ -91,9 +135,10 @@ const Mermaid = ({ chart }: { chart: string }) => {
   }
 
   return (
-    <div className="mermaid flex justify-center bg-white p-4 rounded-xl overflow-x-auto" ref={ref}>
-      {chart}
-    </div>
+    <div 
+      className="flex justify-center bg-white p-4 rounded-xl overflow-x-auto w-full" 
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
   );
 };
 
@@ -291,16 +336,387 @@ Financial Constraints:
 
 export default function App() {
   const [transcript, setTranscript] = useState('');
-  const [transcriptSegments, setTranscriptSegments] = useState<{ speaker: string, text: string, timestamp: string }[]>([]);
+  const [transcriptSegments, setTranscriptSegments] = useState<{ id?: string, speaker: string, text: string, timestamp: string, role?: string, is_partial?: boolean }[]>([]);
   const [speakerAccents, setSpeakerAccents] = useState<Record<string, string>>({});
+  const [speakerRoles, setSpeakerRoles] = useState<Record<string, string>>({});
+  const [isDiarizing, setIsDiarizing] = useState(false);
   const [documentText, setDocumentText] = useState('');
   const [documentName, setDocumentName] = useState('');
-  const [inputMode, setInputMode] = useState<'paste' | 'live' | 'upload' | 'bot'>('paste');
+  const [inputMode, setInputMode] = useState<'paste' | 'live' | 'upload' | 'bot' | 'sdk' | 'system'>('paste');
+  const [sdkState, setSdkState] = useState<'idle' | 'initializing' | 'recording' | 'error'>('idle');
+  const [systemAudioState, setSystemAudioState] = useState<'idle' | 'recording' | 'error'>('idle');
+  const [systemAudioError, setSystemAudioError] = useState<string | null>(null);
+  const [systemAudioStream, setSystemAudioStream] = useState<MediaStream | null>(null);
+  const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  const audioChunksRef = React.useRef<Blob[]>([]);
+  const transcriptionIntervalRef = React.useRef<NodeJS.Timeout | null>(null);
+  const [sdkError, setSdkError] = useState<string | null>(null);
+  const [sdkUploadId, setSdkUploadId] = useState<string | null>(null);
+  const [sdkUploadToken, setSdkUploadToken] = useState<string | null>(null);
+  const [isPreFetchingSdk, setIsPreFetchingSdk] = useState(false);
   const [meetingUrl, setMeetingUrl] = useState('');
   const [botId, setBotId] = useState<string | null>(null);
   const [isBotJoining, setIsBotJoining] = useState(false);
   const [botStatus, setBotStatus] = useState<string>('joining');
   const [isFetchingTranscript, setIsFetchingTranscript] = useState(false);
+  const [isSyncingFull, setIsSyncingFull] = useState(false);
+  const [debugLogs, setDebugLogs] = useState<any[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const [ws, setWs] = useState<WebSocket | null>(null);
+  const transcriptEndRef = React.useRef<HTMLDivElement>(null);
+  const pollIntervalRef = React.useRef<NodeJS.Timeout | null>(null);
+
+  // Participant Tracking (from Electron snippet)
+  const participantsRef = React.useRef<Map<string, { id: string, name: string, lastActive: number }>>(new Map());
+  const currentSpeakerIdRef = React.useRef<string | null>(null);
+  const PLACEHOLDER_NAMES = ['Unknown', 'Guest', 'Host', 'You', 'guest', 'host', 'you'];
+
+  const isPlaceholder = (name: string) => {
+    return !name || PLACEHOLDER_NAMES.includes(name.trim());
+  };
+
+  const updateParticipant = (participantData: any) => {
+    if (!participantData || participantData.id == null) return;
+    const id = String(participantData.id);
+    const incoming = (participantData.name || '').trim();
+    const existing = participantsRef.current.get(id);
+
+    let finalName;
+    if (existing && !isPlaceholder(existing.name)) finalName = existing.name;
+    else if (!isPlaceholder(incoming)) finalName = incoming;
+    else finalName = existing ? existing.name : incoming;
+
+    if (!existing || existing.name !== finalName) {
+      console.log(`[SDK] Participant Update: ${existing?.name || 'New'} -> ${finalName} (ID: ${id})`);
+    }
+
+    participantsRef.current.set(id, { 
+      id, 
+      name: finalName || 'Unknown',
+      lastActive: Date.now()
+    });
+  };
+
+  const resolveName = (participantData: any) => {
+    if (!participantData || participantData.id == null) return 'Unknown';
+    const id = String(participantData.id);
+    const stored = participantsRef.current.get(id);
+
+    // 1. Direct ID match has a real name
+    if (stored && !isPlaceholder(stored.name)) return stored.name;
+
+    // 2. Incoming transcript event has a real name
+    const incoming = (participantData.name || '').trim();
+    if (!isPlaceholder(incoming)) {
+      if (stored) stored.name = incoming;
+      return incoming;
+    }
+
+    // 3. SMART FIX: Fallback to the Active Speaker ID
+    if (currentSpeakerIdRef.current) {
+      const activeSpeaker = participantsRef.current.get(currentSpeakerIdRef.current);
+      if (activeSpeaker && !isPlaceholder(activeSpeaker.name)) {
+        return activeSpeaker.name;
+      }
+    }
+
+    // 4. SMART FIX: Global Fallback. If "Host", just find the latest real name we saw.
+    let bestName = null;
+    let latestTime = 0;
+    for (const p of participantsRef.current.values()) {
+      if (!isPlaceholder(p.name) && p.lastActive > latestTime) {
+        bestName = p.name;
+        latestTime = p.lastActive;
+      }
+    }
+    
+    if (bestName) return bestName;
+    return (stored && stored.name) || incoming || 'Unknown';
+  };
+
+  // Recall.ai Browser SDK Mock/Wrapper
+  const RecallAiWebSdk = React.useMemo(() => ({
+    init: (config: { apiUrl: string }) => {
+      console.log('[SDK] Initializing with API:', config.apiUrl);
+      setSdkState('initializing');
+      setTimeout(() => setSdkState('idle'), 1000);
+    },
+    requestPermission: async (type: string) => {
+      console.log('[SDK] Requesting permission:', type);
+      try {
+        if (type === 'system-audio') {
+          if (!navigator.mediaDevices.getDisplayMedia) {
+            throw new Error('System audio capture not supported in this browser');
+          }
+        }
+        console.log(`[SDK] Permission ${type} granted`);
+        return true;
+      } catch (err: any) {
+        console.error(`[SDK] Permission ${type} denied:`, err);
+        setSdkError(`Permission ${type} denied: ${err.message}`);
+        return false;
+      }
+    },
+    addEventListener: (event: string, callback: (evt: any) => void) => {
+      console.log('[SDK] Event listener added for:', event);
+      // In a real SDK, this would hook into system events
+      // For this web mock, we'll simulate a meeting detection if the user clicks a button
+    },
+    startRecording: async (config: { windowId?: string, uploadToken: string }) => {
+      console.log('[SDK] Starting recording with token:', config.uploadToken);
+      setSdkState('recording');
+      try {
+        // In a real browser SDK, this would use getDisplayMedia
+        const stream = await navigator.mediaDevices.getDisplayMedia({ 
+          video: true, 
+          audio: true 
+        });
+        console.log('[SDK] Recording started successfully');
+        // In a real SDK, the stream would be sent to Recall.ai using the uploadToken
+        return { success: true };
+      } catch (err: any) {
+        console.error('[SDK] Failed to start recording:', err);
+        setSdkState('idle');
+        setSdkError(`Failed to start recording: ${err.message}`);
+        throw err;
+      }
+    }
+  }), []);
+
+  // Pre-fetch SDK token when entering SDK mode to preserve user gesture for prompts
+  useEffect(() => {
+    const preFetchToken = async () => {
+      if (inputMode === 'sdk' && !sdkUploadToken && !isPreFetchingSdk) {
+        setIsPreFetchingSdk(true);
+        try {
+          const res = await fetch('/api/recall/sdk-upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              recording_config: {
+                transcript: { provider: { recallai_streaming: {} } },
+                realtime_endpoints: [
+                  { type: 'desktop_sdk_callback', events: ['transcript.data', 'participant_events.join'] }
+                ]
+              }
+            })
+          });
+          if (res.ok) {
+            const payload = await res.json();
+            setSdkUploadId(payload.id);
+            setSdkUploadToken(payload.upload_token);
+          } else {
+            const errorText = await res.text();
+            console.error('Failed to pre-fetch SDK token (Server Error):', res.status, errorText);
+          }
+        } catch (err) {
+          console.error('Failed to pre-fetch SDK token (Network Error):', err);
+        } finally {
+          setIsPreFetchingSdk(false);
+        }
+      }
+    };
+    preFetchToken();
+  }, [inputMode, sdkUploadToken, isPreFetchingSdk]);
+
+  const handleStartSdkRecording = async () => {
+    if (!sdkUploadToken) {
+      setSdkError("SDK not ready. Please wait a moment or refresh.");
+      return;
+    }
+
+    setSdkError(null);
+    try {
+      // 1. Initialize (Synchronous)
+      RecallAiWebSdk.init({ apiUrl: "https://us-west-2.recall.ai" });
+      
+      // 2. Request Permissions (Directly from user gesture)
+      const audioGranted = await RecallAiWebSdk.requestPermission("system-audio");
+      if (!audioGranted) return;
+
+      // 3. Start Recording
+      await RecallAiWebSdk.startRecording({
+        uploadToken: sdkUploadToken
+      });
+
+    } catch (err: any) {
+      setSdkError(err.message);
+      setSdkState('error');
+    }
+  };
+
+  const scrollToBottom = () => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    if (transcriptSegments.length > 0) {
+      scrollToBottom();
+    }
+  }, [transcriptSegments]);
+
+  const getSpeakerColor = (speaker: string) => {
+    const s = speaker.toLowerCase();
+    if (s.includes('customer')) return "bg-blue-100 text-blue-600";
+    if (s.includes('architect')) return "bg-emerald-100 text-emerald-600";
+    if (s.includes('bot') || s.includes('recall')) return "bg-purple-100 text-purple-600";
+    
+    // Hash-based color for others
+    const colors = [
+      "bg-amber-100 text-amber-600",
+      "bg-rose-100 text-rose-600",
+      "bg-indigo-100 text-indigo-600",
+      "bg-cyan-100 text-cyan-600",
+      "bg-orange-100 text-orange-600",
+      "bg-lime-100 text-lime-600",
+      "bg-pink-100 text-pink-600"
+    ];
+    let hash = 0;
+    for (let i = 0; i < speaker.length; i++) {
+      hash = speaker.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return colors[Math.abs(hash) % colors.length];
+  };
+
+  const formatTranscriptTimestamp = (seconds: number | null) => {
+    if (seconds === null) return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    // If it's a large number, assume it's a unix timestamp
+    if (seconds > 1000000000) {
+      return new Date(seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+    
+    // Otherwise assume it's relative seconds
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  useEffect(() => {
+    const activeId = inputMode === 'bot' ? botId : (inputMode === 'sdk' ? sdkUploadId : null);
+    if (!activeId) return;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+
+    socket.onopen = () => {
+      console.log('[WS] Connected to server');
+      socket.send(JSON.stringify({ type: 'subscribe', botId: activeId }));
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'transcript') {
+          console.log('[WS] Received transcript update:', data.transcript);
+          
+          // Handle participant event (if broadcasted as a transcript type with event_type)
+          if (data.transcript.event_type === 'participant_event') {
+            const pEvent = data.transcript.event;
+            const pData = data.transcript.data?.participant || data.transcript.data?.data?.participant;
+            
+            if (pEvent === 'participant_events.speech_on') {
+              if (pData && pData.id != null) {
+                currentSpeakerIdRef.current = String(pData.id);
+                updateParticipant(pData);
+              }
+            } else if (['participant_events.join', 'participant_events.update'].includes(pEvent)) {
+              if (pData) updateParticipant(pData);
+            }
+            return;
+          }
+
+          const normalize = (s: any) => {
+            if (!s) return null;
+            let text = s.text || '';
+            let startTime = s.start_time ?? s.words?.[0]?.start_timestamp?.relative ?? null;
+            
+            // Use resolveName for speaker identification
+            const participant = s.participant || (s.words?.[0]?.participant);
+            const speaker = resolveName(participant) || s.speaker || 'Unknown';
+
+            if (!text && s.words && Array.isArray(s.words)) {
+              text = s.words.map((w: any) => w.text || w.word || '').join(' ').trim();
+              if (startTime === null && s.words[0]) {
+                startTime = s.words[0].start_time ?? s.words[0].start_timestamp?.relative ?? null;
+              }
+            }
+            if (!text) return null;
+            return {
+              speaker,
+              text,
+              is_partial: s.is_partial || false,
+              timestamp: formatTranscriptTimestamp(startTime)
+            };
+          };
+
+          const segment = normalize(data.transcript);
+          if (segment) {
+            // Detect accent for new speakers
+            if (!speakerAccents[segment.speaker]) {
+              detectAccent(segment.text).then(accent => {
+                setSpeakerAccents(prev => ({ ...prev, [segment.speaker]: accent }));
+              });
+            }
+
+            setTranscriptSegments(prev => {
+              // If the last segment is partial and from the same speaker, replace it
+              const last = prev[prev.length - 1];
+              if (last && last.speaker === segment.speaker && last.is_partial) {
+                return [...prev.slice(0, -1), segment];
+              }
+              // If it's a new segment or not partial, append it
+              return [...prev, segment];
+            });
+          }
+        }
+      } catch (e) {
+        console.error('[WS] Error handling message:', e);
+      }
+    };
+
+    socket.onclose = () => {
+      console.log('[WS] Disconnected from server');
+    };
+
+    setWs(socket);
+
+    return () => {
+      socket.close();
+    };
+  }, [botId, sdkUploadId, inputMode]);
+
+  useEffect(() => {
+    if (transcriptSegments.length > 0) {
+      const fullTranscript = transcriptSegments.map(s => `${s.speaker}: ${s.text}${s.is_partial ? '...' : ''}`).join('\n');
+      setTranscript(fullTranscript);
+    }
+  }, [transcriptSegments]);
+
+  const fetchDebugLogs = async () => {
+    try {
+      const response = await fetch('/api/debug/webhooks');
+      const data = await response.json();
+      setDebugLogs(data);
+    } catch (error) {
+      console.error('Failed to fetch debug logs:', error);
+    }
+  };
+
+  const testWebhook = async () => {
+    if (!botId) return;
+    try {
+      await fetch('/api/debug/test-webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ botId })
+      });
+      // The server's test-webhook endpoint should also broadcast via WS
+      setTimeout(fetchDebugLogs, 1000);
+    } catch (error) {
+      console.error('Failed to trigger test webhook:', error);
+    }
+  };
   const [livePerson1, setLivePerson1] = useState('');
   const [livePerson2, setLivePerson2] = useState('');
   const [person1VoiceSample, setPerson1VoiceSample] = useState<string | null>(null);
@@ -354,7 +770,7 @@ export default function App() {
     let recognition: any = null;
     let shouldRestart = true;
     
-    if (isRecording) {
+    if (isRecording && inputMode === 'live') {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (SpeechRecognition) {
         recognition = new SpeechRecognition();
@@ -364,43 +780,66 @@ export default function App() {
         
         recognition.onresult = async (event: any) => {
           let finalTranscript = '';
+          let interimTranscript = '';
           for (let i = event.resultIndex; i < event.results.length; i++) {
             if (event.results[i].isFinal) {
               finalTranscript += event.results[i][0].transcript;
+            } else {
+              interimTranscript += event.results[i][0].transcript;
             }
           }
           
-          if (finalTranscript) {
+          if (finalTranscript || interimTranscript) {
             let targetSpeaker = activeSpeakerRef.current;
             const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             const speakerName = targetSpeaker === 1 ? 'Customer' : 'Architect';
             
-            if (isAutoDiarizationEnabledRef.current) {
+            const textToProcess = finalTranscript || interimTranscript;
+            const isFinal = !!finalTranscript;
+
+            if (isFinal && isAutoDiarizationEnabledRef.current) {
               // Smart Diarization: Guess speaker based on content
-              targetSpeaker = await diarizeSpeaker(finalTranscript, livePerson1Ref.current, livePerson2Ref.current);
+              targetSpeaker = await diarizeSpeaker(textToProcess, livePerson1Ref.current, livePerson2Ref.current);
               setActiveSpeaker(targetSpeaker);
             }
 
-            setTranscriptSegments(prev => [...prev, { 
-              speaker: speakerName, 
-              text: finalTranscript.trim(), 
-              timestamp 
-            }]);
+            setTranscriptSegments(prev => {
+              const newSegments = [...prev];
+              // If the last segment was partial and from the same speaker, replace it
+              if (newSegments.length > 0 && newSegments[newSegments.length - 1].is_partial && newSegments[newSegments.length - 1].speaker === speakerName) {
+                newSegments[newSegments.length - 1] = {
+                  speaker: speakerName,
+                  text: textToProcess.trim(),
+                  timestamp,
+                  is_partial: !isFinal
+                };
+              } else {
+                newSegments.push({ 
+                  speaker: speakerName, 
+                  text: textToProcess.trim(), 
+                  timestamp,
+                  is_partial: !isFinal
+                });
+              }
+              return newSegments;
+            });
 
-            // Detect accent for the speaker if not already detected
-            if (!speakerAccents[speakerName]) {
-              detectAccent(finalTranscript.trim()).then(accent => {
-                setSpeakerAccents(prev => ({ ...prev, [speakerName]: accent }));
-              });
-            }
+            if (isFinal) {
+              // Detect accent for the speaker if not already detected
+              if (!speakerAccents[speakerName]) {
+                detectAccent(textToProcess.trim()).then(accent => {
+                  setSpeakerAccents(prev => ({ ...prev, [speakerName]: accent }));
+                });
+              }
 
-            if (targetSpeaker === 1) {
-              setLivePerson1(prev => prev + (prev ? ' ' : '') + finalTranscript.trim());
-            } else {
-              setLivePerson2(prev => prev + (prev ? ' ' : '') + finalTranscript.trim());
+              if (targetSpeaker === 1) {
+                setLivePerson1(prev => prev + (prev ? ' ' : '') + textToProcess.trim());
+              } else {
+                setLivePerson2(prev => prev + (prev ? ' ' : '') + textToProcess.trim());
+              }
+              
+              setTranscript(prev => prev + (prev ? '\n' : '') + `${speakerName}: ${textToProcess.trim()}`);
             }
-            
-            setTranscript(prev => prev + (prev ? '\n' : '') + `${speakerName}: ${finalTranscript.trim()}`);
           }
         };
         
@@ -409,13 +848,19 @@ export default function App() {
           // 'aborted' often happens when we stop it manually or it's interrupted
           if (event.error === 'aborted') return;
           
+          if (event.error === 'not-allowed') {
+            setError('Microphone access denied. Please check your browser settings or try opening the app in a new tab to bypass iframe restrictions.');
+          } else if (event.error !== 'no-speech') {
+            setError(`Speech recognition error: ${event.error}`);
+          }
+
           if (event.error !== 'no-speech') {
             setIsRecording(false);
           }
         };
         
         recognition.onend = () => {
-          if (isRecordingRef.current && shouldRestart) {
+          if (isRecordingRef.current && shouldRestart && inputMode === 'live') {
             try {
               recognition.start();
             } catch (e) {
@@ -426,7 +871,7 @@ export default function App() {
         
         recognition.start();
       } else {
-        alert('Speech recognition is not supported in this browser.');
+        setError('Speech recognition is not supported in this browser.');
         setIsRecording(false);
       }
     }
@@ -441,7 +886,7 @@ export default function App() {
         }
       }
     };
-  }, [isRecording]);
+  }, [isRecording, inputMode]);
 
   const loadSample = () => {
     if (inputMode === 'paste') {
@@ -564,6 +1009,12 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    };
+  }, []);
+
   const handleJoinBot = async () => {
     if (!meetingUrl) return;
     setIsBotJoining(true);
@@ -599,10 +1050,16 @@ export default function App() {
   };
 
   const pollTranscript = async (id: string) => {
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     setIsFetchingTranscript(true);
-    const interval = setInterval(async () => {
+    
+    pollIntervalRef.current = setInterval(async () => {
       try {
         const response = await fetch(`/api/recall/bot/${id}`);
+        if (!response.ok) {
+          console.warn(`[Poll] Server returned ${response.status} for bot ${id}`);
+          return;
+        }
         const text = await response.text();
         let data;
         try {
@@ -619,30 +1076,43 @@ export default function App() {
         // Recall.ai transcript: segments may use { speaker, text } or v2 { speaker, words:[{text,start_time}] }
         if (data.transcript) {
           const rawSegments = (Array.isArray(data.transcript) ? data.transcript : [data.transcript]);
+          console.log(`[Poll] Received ${rawSegments.length} segments for bot ${id}`);
+          
           // Normalize each segment regardless of Recall.ai version
           const normalize = (s: any) => {
             if (!s) return null;
+            // Handle both raw Recall.ai format and our normalized DB format
             let text = s.text || '';
-            let startTime = s.start_time || null;
+            let startTime = s.start_time ?? s.words?.[0]?.start_timestamp?.relative ?? null;
+            
+            // Use resolveName for speaker identification
+            const participant = s.participant || (s.words?.[0]?.participant);
+            if (participant) updateParticipant(participant);
+            const speaker = resolveName(participant) || s.speaker || 'Unknown';
+
             if (!text && s.words && Array.isArray(s.words)) {
               text = s.words.map((w: any) => w.text || w.word || '').join(' ').trim();
-              startTime = s.words[0]?.start_time ?? null;
+              if (startTime === null && s.words[0]) {
+                startTime = s.words[0].start_time ?? s.words[0].start_timestamp?.relative ?? null;
+              }
             }
             if (!text) return null;
             return {
-              speaker: s.speaker || 'Unknown',
+              speaker,
               text,
-              timestamp: startTime
+              is_partial: s.is_partial || false,
+              timestamp: startTime !== null
                 ? new Date(startTime * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
                 : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
             };
           };
-          const segments = rawSegments.map(normalize).filter(Boolean) as { speaker: string, text: string, timestamp: string }[];
+          const segments = rawSegments.map(normalize).filter(Boolean) as { speaker: string, text: string, timestamp: string, is_partial: boolean }[];
+          
           if (segments.length > 0) {
             setTranscriptSegments(segments);
-            const fullTranscript = segments.map(s => `${s.speaker}: ${s.text}`).join('\n');
+            const fullTranscript = segments.map(s => `${s.speaker}: ${s.text}${s.is_partial ? '...' : ''}`).join('\n');
             setTranscript(fullTranscript);
-
+            
             // Detect accents for new speakers
             segments.forEach(async (s) => {
               if (!speakerAccents[s.speaker]) {
@@ -653,14 +1123,197 @@ export default function App() {
           }
         }
 
-        if (data.status === 'done' || data.status === 'fatal' || data.status === 'completed') {
-          clearInterval(interval);
+        if (data.status === 'done' || data.status === 'fatal' || data.status === 'completed' || data.status === 'transcript.done') {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
           setIsFetchingTranscript(false);
         }
-      } catch (err) {
-        console.error('Polling error:', err);
+      } catch (err: any) {
+        // Only log if it's not a transient network error during dev server restart
+        if (err.name !== 'TypeError' || !err.message.includes('Failed to fetch')) {
+          console.error('Polling error:', err);
+        }
       }
     }, 5000); // Poll every 5 seconds
+  };
+
+  const fetchFullTranscript = async () => {
+    const activeId = botId || sdkUploadId;
+    if (!activeId) return;
+    setIsSyncingFull(true);
+    try {
+      const response = await fetch(`/api/recall/bot/${activeId}?force=true`);
+      const text = await response.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (e) {
+        console.error('Failed to parse full transcript response:', text);
+        return;
+      }
+      
+      if (data.transcript) {
+        const rawSegments = (Array.isArray(data.transcript) ? data.transcript : [data.transcript]);
+        const normalize = (s: any) => {
+          if (!s) return null;
+          let text = s.text || '';
+          let startTime = s.start_time ?? s.words?.[0]?.start_timestamp?.relative ?? null;
+          const speaker = s.speaker || s.participant?.name || 'Unknown';
+          if (!text && s.words && Array.isArray(s.words)) {
+            text = s.words.map((w: any) => w.text || w.word || '').join(' ').trim();
+            if (startTime === null && s.words[0]) {
+              startTime = s.words[0].start_time ?? s.words[0].start_timestamp?.relative ?? null;
+            }
+          }
+          if (!text) return null;
+          return {
+            speaker,
+            text,
+            is_partial: s.is_partial || false,
+            timestamp: startTime !== null
+              ? new Date(startTime * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+              : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          };
+        };
+        const segments = rawSegments.map(normalize).filter(Boolean) as { speaker: string, text: string, timestamp: string, is_partial: boolean }[];
+        if (segments.length > 0) {
+          setTranscriptSegments(segments);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch full transcript:', err);
+    } finally {
+      setIsSyncingFull(false);
+    }
+  };
+
+  const handleStartSystemAudio = async () => {
+    setSystemAudioError(null);
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        stream.getTracks().forEach(t => t.stop());
+        throw new Error("No audio track found in the selected share. Please ensure 'Share audio' is checked.");
+      }
+
+      setSystemAudioStream(stream);
+      setSystemAudioState('recording');
+      setIsRecording(true); // Reuse the recording state for transcription logic
+
+      // Handle stream stop (e.g. user clicks "Stop sharing" in browser UI)
+      audioTracks[0].onended = () => {
+        setSystemAudioState('idle');
+        setIsRecording(false);
+        setSystemAudioStream(null);
+      };
+
+    } catch (err: any) {
+      console.error('[System Audio] Error:', err);
+      setSystemAudioError(err.message || "Failed to capture system audio");
+      setSystemAudioState('error');
+    }
+  };
+
+  const handleStopSystemAudio = () => {
+    if (systemAudioStream) {
+      systemAudioStream.getTracks().forEach(track => track.stop());
+      setSystemAudioStream(null);
+    }
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+    }
+    if (transcriptionIntervalRef.current) {
+      clearInterval(transcriptionIntervalRef.current);
+    }
+    setSystemAudioState('idle');
+    setIsRecording(false);
+  };
+
+  useEffect(() => {
+    if (systemAudioStream && systemAudioState === 'recording') {
+      const mediaRecorder = new MediaRecorder(systemAudioStream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      const processAudio = async () => {
+        if (audioChunksRef.current.length > 0) {
+          const chunksToProcess = [...audioChunksRef.current];
+          audioChunksRef.current = []; // Clear for next batch
+          
+          const blob = new Blob(chunksToProcess, { type: 'audio/webm' });
+          const reader = new FileReader();
+          reader.readAsDataURL(blob);
+          reader.onloadend = async () => {
+            const base64Audio = (reader.result as string).split(',')[1];
+            try {
+              const text = await transcribeAudio(base64Audio, 'audio/webm');
+              if (text && text.trim()) {
+                const newSegment = {
+                  id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+                  speaker: "System Audio",
+                  text: text.trim(),
+                  timestamp: new Date().toLocaleTimeString(),
+                  role: "Participant"
+                };
+                setTranscriptSegments(prev => [...prev, newSegment]);
+              }
+            } catch (err) {
+              console.error("Transcription error:", err);
+            }
+          };
+        }
+      };
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        await processAudio();
+      };
+
+      mediaRecorder.start(1000); // Collect data every second
+
+      // Set up interval to transcribe every 6 seconds for better real-time feel
+      transcriptionIntervalRef.current = setInterval(async () => {
+        await processAudio();
+      }, 6000);
+
+      return () => {
+        if (mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        if (transcriptionIntervalRef.current) {
+          clearInterval(transcriptionIntervalRef.current);
+        }
+      };
+    }
+  }, [systemAudioStream, systemAudioState]);
+
+  const handleAutoLabelRoles = async () => {
+    if (transcriptSegments.length === 0) return;
+    setIsDiarizing(true);
+    try {
+      const speakers = Array.from(new Set(transcriptSegments.map(s => s.speaker)));
+      const fullText = transcriptSegments.map(s => `${s.speaker}: ${s.text}`).join('\n');
+      const roles = await assignRoles(fullText, speakers);
+      setSpeakerRoles(prev => ({ ...prev, ...roles }));
+    } catch (err) {
+      console.error('Failed to auto-label roles:', err);
+    } finally {
+      setIsDiarizing(false);
+    }
   };
 
   const handleAnalyze = async () => {
@@ -670,6 +1323,8 @@ export default function App() {
       finalTranscript = transcript;
     } else if (inputMode === 'live') {
       finalTranscript = `Customer: ${livePerson1}\nArchitect: ${livePerson2}`;
+    } else if (inputMode === 'system') {
+      finalTranscript = transcriptSegments.map(s => `${s.speaker}: ${s.text}`).join('\n');
     }
 
     if (!finalTranscript.trim()) return;
@@ -888,6 +1543,18 @@ export default function App() {
                     >
                       Bot
                     </button>
+                    <button 
+                      onClick={() => setInputMode('sdk')}
+                      className={cn("px-3 py-1 rounded-md text-[9px] font-bold uppercase tracking-widest transition-all", inputMode === 'sdk' ? "bg-white shadow-sm text-black" : "text-black/40")}
+                    >
+                      SDK
+                    </button>
+                    <button 
+                      onClick={() => setInputMode('system')}
+                      className={cn("px-3 py-1 rounded-md text-[9px] font-bold uppercase tracking-widest transition-all", inputMode === 'system' ? "bg-white shadow-sm text-black" : "text-black/40")}
+                    >
+                      System Audio
+                    </button>
                   </div>
                   <button onClick={loadSample} className="text-[9px] font-bold uppercase tracking-widest text-black/40 hover:text-black">Sample</button>
                 </div>
@@ -963,6 +1630,450 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                ) : inputMode === 'sdk' ? (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="space-y-6"
+                  >
+                    <div className="bg-black/5 rounded-2xl p-6 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-black rounded-full flex items-center justify-center">
+                            <Monitor className="w-5 h-5 text-white" />
+                          </div>
+                          <div className="space-y-0.5">
+                            <p className="text-[11px] font-black uppercase tracking-widest">Browser Recording SDK</p>
+                            <p className="text-[9px] text-black/40 font-bold uppercase tracking-widest">Direct Browser-to-Recall Stream</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full",
+                            sdkState === 'recording' ? "bg-red-500 animate-pulse" : "bg-black/20"
+                          )} />
+                          <span className="text-[8px] font-black uppercase tracking-widest text-black/40">
+                            {sdkState === 'recording' ? "Recording" : "Idle"}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-white border border-black/5 space-y-3">
+                        <div className="flex items-start gap-3">
+                          <div className="p-1.5 rounded-lg bg-black/5">
+                            <Settings className="w-3 h-3 text-black/60" />
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-[9px] font-bold uppercase tracking-widest">SDK Control</p>
+                            <p className="text-[8px] text-black/40 font-medium leading-relaxed">
+                              The Browser SDK records your meeting audio directly from the browser tab. 
+                              Make sure to check "Share audio" when selecting the meeting tab.
+                            </p>
+                          </div>
+                        </div>
+
+                        {sdkError && (
+                          <div className="p-2 rounded-lg bg-red-50 border border-red-100 flex items-center gap-2">
+                            <AlertCircle className="w-3 h-3 text-red-500" />
+                            <p className="text-[8px] font-bold text-red-600 uppercase tracking-widest">{sdkError}</p>
+                          </div>
+                        )}
+
+                        <button
+                          onClick={handleStartSdkRecording}
+                          disabled={sdkState === 'recording' || sdkState === 'initializing' || (!sdkUploadToken && isPreFetchingSdk)}
+                          className={cn(
+                            "w-full flex items-center justify-center gap-2 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                            sdkState === 'recording' 
+                              ? "bg-red-500 text-white shadow-lg shadow-red-500/20" 
+                              : (!sdkUploadToken && isPreFetchingSdk)
+                                ? "bg-black/5 text-black/20 cursor-not-allowed"
+                                : "bg-black text-white shadow-xl hover:scale-[1.01] active:scale-[0.99]"
+                          )}
+                        >
+                          {sdkState === 'initializing' || (!sdkUploadToken && isPreFetchingSdk) ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : sdkState === 'recording' ? (
+                            <div className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                          ) : (
+                            <Play className="w-3 h-3" />
+                          )}
+                          {sdkState === 'initializing' ? "Initializing..." : (!sdkUploadToken && isPreFetchingSdk) ? "Preparing SDK..." : sdkState === 'recording' ? "Recording..." : "Start SDK Recording"}
+                        </button>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div className="p-4 rounded-xl bg-amber-50 border border-amber-100 space-y-3">
+                          <div className="flex items-start gap-3">
+                            <Info className="w-3 h-3 text-amber-600 shrink-0 mt-0.5" />
+                            <div className="space-y-1">
+                              <p className="text-[8px] font-bold text-amber-700 uppercase tracking-widest leading-relaxed">
+                                Important: Browser SDK requires a "Secure Context" and specific permissions.
+                              </p>
+                              <p className="text-[8px] text-amber-600/80 font-medium leading-relaxed">
+                                If you encounter "Permission Denied" errors, try opening the app in a new tab to bypass iframe restrictions.
+                              </p>
+                            </div>
+                          </div>
+                          <a 
+                            href={window.location.href} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="flex items-center justify-center gap-2 w-full py-2 bg-amber-600/10 hover:bg-amber-600/20 text-amber-700 rounded-xl text-[8px] font-black uppercase tracking-widest transition-all"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            Open in New Tab
+                          </a>
+                        </div>
+                        
+                        <div className="p-4 rounded-xl bg-black/5 border border-black/5 flex items-start gap-3">
+                          <Info className="w-3 h-3 text-black/40 shrink-0 mt-0.5" />
+                          <p className="text-[8px] font-bold text-black/40 uppercase tracking-widest leading-relaxed">
+                            Note: If you need to switch to the Desktop SDK for Zoom/Teams native apps, 
+                            please download the Recall.ai Desktop Client.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="bg-black/5 rounded-2xl p-6 space-y-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-black rounded-full flex items-center justify-center">
+                            <MessageSquare className="w-5 h-5 text-white" />
+                          </div>
+                          <div className="space-y-0.5">
+                            <div className="flex items-center gap-2">
+                              <p className="text-[11px] font-black uppercase tracking-widest">SDK Meeting Transcripts</p>
+                              {sdkState === 'recording' && (
+                                <div className="flex items-center gap-1 bg-emerald-500/10 px-1.5 py-0.5 rounded-md border border-emerald-500/20">
+                                  <div className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse" />
+                                  <span className="text-[7px] font-black text-emerald-600 uppercase tracking-widest">Live Feed</span>
+                                </div>
+                              )}
+                            </div>
+                            <p className="text-[9px] text-black/40 font-bold uppercase tracking-widest">Real-time Conversation Stream</p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between mb-4">
+                          <div className="flex items-center gap-2">
+                            <div className={cn(
+                              "w-2 h-2 rounded-full animate-pulse",
+                              sdkState === 'recording' ? "bg-emerald-500" : "bg-red-500"
+                            )} />
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-black/40">Status: {sdkState}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button 
+                              onClick={handleAutoLabelRoles}
+                              disabled={isDiarizing || transcriptSegments.length === 0}
+                              className={cn(
+                                "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
+                                isDiarizing || transcriptSegments.length === 0
+                                  ? "bg-black/5 text-black/20 cursor-not-allowed" 
+                                  : "bg-black/5 text-black/60 hover:bg-black/10"
+                              )}
+                            >
+                              {isDiarizing ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Users className="w-3 h-3" />
+                              )}
+                              {isDiarizing ? "Diarizing..." : "Auto-Label Roles"}
+                            </button>
+                            <button 
+                              onClick={fetchFullTranscript}
+                              disabled={isSyncingFull}
+                              className={cn(
+                                "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
+                                isSyncingFull 
+                                  ? "bg-black/5 text-black/20 cursor-not-allowed" 
+                                  : "bg-black/5 text-black/60 hover:bg-black/10"
+                              )}
+                            >
+                              {isSyncingFull ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Download className="w-3 h-3" />
+                              )}
+                              {isSyncingFull ? "Syncing..." : "Fetch Complete Transcript"}
+                            </button>
+                            <button 
+                              onClick={() => sdkUploadId && pollTranscript(sdkUploadId)}
+                              className="p-1.5 hover:bg-black/5 rounded-lg transition-colors"
+                              title="Refresh Transcript"
+                            >
+                              <RefreshCw className={cn("w-3.5 h-3.5 text-black/40", isFetchingTranscript && "animate-spin")} />
+                            </button>
+                            <button 
+                              onClick={() => {
+                                setShowDebug(!showDebug);
+                                if (!showDebug) fetchDebugLogs();
+                              }}
+                              className="p-1.5 hover:bg-black/5 rounded-lg transition-colors"
+                              title="Debug Info"
+                            >
+                              <Settings className="w-3.5 h-3.5 text-black/40" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {showDebug && (
+                          <div className="mb-4 p-3 bg-black/5 rounded-xl border border-black/10 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-[9px] font-bold uppercase tracking-widest text-black/60">Debug: Webhook Logs</h4>
+                              <div className="flex gap-2">
+                                <button onClick={testWebhook} className="text-[8px] font-bold uppercase text-emerald-600 hover:underline">Test Webhook</button>
+                                <button onClick={fetchDebugLogs} className="text-[8px] font-bold uppercase text-blue-600 hover:underline">Refresh Logs</button>
+                              </div>
+                            </div>
+                            <div className="max-h-[150px] overflow-y-auto text-[8px] font-mono space-y-1 custom-scrollbar">
+                              {debugLogs.length > 0 ? (
+                                debugLogs.map((log, i) => (
+                                  <div key={i} className="border-b border-black/5 pb-1">
+                                    <span className="text-black/40">[{new Date(log.timestamp).toLocaleTimeString()}]</span>{" "}
+                                    <span className="text-blue-600">{log.event}</span>{" "}
+                                    <span className="text-black/60">Bot: {log.bot_id}</span>
+                                  </div>
+                                ))
+                              ) : (
+                                <div className="text-black/30 italic">No logs yet...</div>
+                              )}
+                            </div>
+                            {sdkUploadId && (
+                              <div className="text-[8px] text-black/40 break-all">
+                                Current SDK Upload ID: <span className="text-black/80 font-bold">{sdkUploadId}</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="bg-white rounded-xl border border-black/5 p-4 min-h-[400px] max-h-[600px] overflow-y-auto custom-scrollbar relative">
+                          <AnimatePresence mode="popLayout">
+                            {transcriptSegments.length > 0 ? (
+                              <div className="space-y-4">
+                                {transcriptSegments.map((segment, index) => (
+                                  <motion.div
+                                    key={`${segment.timestamp}-${index}`}
+                                    initial={{ opacity: 0, y: 10, scale: 0.98 }}
+                                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                                    className={cn(
+                                      "group p-4 rounded-2xl transition-all duration-300",
+                                      segment.is_partial 
+                                        ? "bg-emerald-50/30 border border-dashed border-emerald-200/50" 
+                                        : "bg-white border border-black/5 hover:border-black/10 hover:shadow-md"
+                                    )}
+                                  >
+                                    <div className="flex items-center justify-between mb-3">
+                                      <div className="flex items-center gap-3">
+                                        <div className={cn(
+                                          "w-8 h-8 rounded-full flex items-center justify-center text-[12px] font-black uppercase shadow-sm",
+                                          getSpeakerColor(segment.speaker)
+                                        )}>
+                                          {segment.speaker[0]}
+                                        </div>
+                                        <div className="space-y-0.5">
+                                          <div className="flex items-center gap-2">
+                                            <span className="text-[11px] font-black uppercase tracking-widest text-black/80">{segment.speaker}</span>
+                                            {speakerAccents[segment.speaker] && (
+                                              <div className="flex items-center gap-1 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100">
+                                                <Globe className="w-2.5 h-2.5 text-blue-500" />
+                                                <span className="text-[8px] font-black text-blue-600 uppercase tracking-widest">
+                                                  {speakerAccents[segment.speaker]} Accent
+                                                </span>
+                                              </div>
+                                            )}
+                                          </div>
+                                          <div className="flex items-center gap-2 text-[8px] font-bold text-black/30 uppercase tracking-widest">
+                                            <Clock className="w-2.5 h-2.5" />
+                                            <span>{segment.timestamp}</span>
+                                          </div>
+                                        </div>
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        {segment.is_partial && (
+                                          <div className="flex items-center gap-1.5 bg-emerald-100/50 px-2 py-1 rounded-full border border-emerald-200/50">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                            <span className="text-[8px] font-black text-emerald-700 uppercase tracking-widest">Live</span>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <p className={cn(
+                                      "text-[13px] leading-relaxed font-medium pl-11",
+                                      segment.is_partial ? "text-black/50 italic" : "text-black/80"
+                                    )}>
+                                      {segment.text}
+                                      {segment.is_partial && <span className="inline-block w-1 h-4 ml-1 bg-emerald-500/50 animate-pulse align-middle" />}
+                                    </p>
+                                  </motion.div>
+                                ))}
+                                <div ref={transcriptEndRef} />
+                              </div>
+                            ) : (
+                              <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-8 space-y-4">
+                                <div className="w-16 h-16 bg-black/5 rounded-full flex items-center justify-center">
+                                  <Activity className="w-8 h-8 text-black/20" />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-[11px] font-black uppercase tracking-widest text-black/40">Waiting for SDK Audio</p>
+                                  <p className="text-[9px] text-black/20 font-bold uppercase tracking-widest max-w-[200px]">
+                                    Once you start recording and meeting audio is detected, transcripts will appear here in real-time.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+                          </AnimatePresence>
+                        </div>
+                      </div>
+                    </div>
+                  </motion.div>
+                ) : inputMode === 'system' ? (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="space-y-6"
+                  >
+                    <div className="bg-black/5 rounded-2xl p-6 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-black rounded-full flex items-center justify-center">
+                            <Volume2 className="w-5 h-5 text-white" />
+                          </div>
+                          <div className="space-y-0.5">
+                            <p className="text-[11px] font-black uppercase tracking-widest">System Audio Capture</p>
+                            <p className="text-[9px] text-black/40 font-bold uppercase tracking-widest">Direct System-to-Transcript</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full",
+                            systemAudioState === 'recording' ? "bg-red-500 animate-pulse" : "bg-black/20"
+                          )} />
+                          <span className="text-[8px] font-black uppercase tracking-widest text-black/40">
+                            {systemAudioState === 'recording' ? "Capturing" : "Idle"}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-white border border-black/5 space-y-3">
+                        <div className="flex items-start gap-3">
+                          <div className="p-1.5 rounded-lg bg-black/5">
+                            <Settings className="w-3 h-3 text-black/60" />
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-[9px] font-bold uppercase tracking-widest">Capture Control</p>
+                            <p className="text-[8px] text-black/40 font-medium leading-relaxed">
+                              This feature captures audio directly from your system or a specific tab. 
+                              When the browser prompt appears, select the tab/window and ensure <strong>"Share audio"</strong> is enabled.
+                            </p>
+                          </div>
+                        </div>
+
+                        {systemAudioError && (
+                          <div className="p-2 rounded-lg bg-red-50 border border-red-100 flex items-center gap-2">
+                            <AlertCircle className="w-3 h-3 text-red-500" />
+                            <p className="text-[8px] font-bold text-red-600 uppercase tracking-widest">{systemAudioError}</p>
+                          </div>
+                        )}
+
+                        <button
+                          onClick={systemAudioState === 'recording' ? handleStopSystemAudio : handleStartSystemAudio}
+                          className={cn(
+                            "w-full flex items-center justify-center gap-2 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                            systemAudioState === 'recording' 
+                              ? "bg-red-500 text-white shadow-lg shadow-red-500/20" 
+                              : "bg-black text-white shadow-xl hover:scale-[1.01] active:scale-[0.99]"
+                          )}
+                        >
+                          {systemAudioState === 'recording' ? (
+                            <Square className="w-3 h-3" />
+                          ) : (
+                            <Play className="w-3 h-3" />
+                          )}
+                          {systemAudioState === 'recording' ? "Stop Capture" : "Start System Audio Capture"}
+                        </button>
+                      </div>
+
+                      <div className="bg-black/5 rounded-2xl p-6 space-y-4">
+                        <div className="flex items-center justify-between mb-4">
+                          <div className="flex items-center gap-2 text-black/40">
+                            <MessageSquare className="w-4 h-4" />
+                            <span className="text-[11px] font-bold uppercase tracking-widest">Live Transcripts</span>
+                          </div>
+                          <button 
+                            onClick={handleAutoLabelRoles}
+                            disabled={isDiarizing || transcriptSegments.length === 0}
+                            className={cn(
+                              "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
+                              isDiarizing || transcriptSegments.length === 0
+                                ? "bg-black/5 text-black/20 cursor-not-allowed" 
+                                : "bg-black/5 text-black/60 hover:bg-black/10"
+                            )}
+                          >
+                            {isDiarizing ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Users className="w-3 h-3" />
+                            )}
+                            {isDiarizing ? "Diarizing..." : "Auto-Label Roles"}
+                          </button>
+                        </div>
+
+                        <div className="bg-white rounded-xl border border-black/5 p-4 min-h-[400px] max-h-[600px] overflow-y-auto custom-scrollbar space-y-6 shadow-inner">
+                          {transcriptSegments.length > 0 ? (
+                            transcriptSegments.map((segment, index) => (
+                              <motion.div 
+                                key={segment.id || index}
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                className="space-y-2 group"
+                              >
+                                <div className="flex items-center justify-between">
+                                  <div className="flex items-center gap-3">
+                                    <div className={cn(
+                                      "w-8 h-8 rounded-full flex items-center justify-center text-[12px] font-black uppercase shadow-sm",
+                                      getSpeakerColor(segment.speaker)
+                                    )}>
+                                      {segment.speaker[0]}
+                                    </div>
+                                    <div className="space-y-0.5">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-[11px] font-black uppercase tracking-widest text-black/80">{segment.speaker}</span>
+                                        {speakerRoles[segment.speaker] && (
+                                          <div className="flex items-center gap-1 bg-black/5 px-2 py-0.5 rounded-full border border-black/5">
+                                            <Shield className="w-2.5 h-2.5 text-black/40" />
+                                            <span className="text-[8px] font-black text-black/60 uppercase tracking-widest">
+                                              {speakerRoles[segment.speaker]}
+                                            </span>
+                                          </div>
+                                        )}
+                                      </div>
+                                      <div className="flex items-center gap-2 text-[8px] font-bold text-black/30 uppercase tracking-widest">
+                                        <Clock className="w-2.5 h-2.5" />
+                                        <span>{segment.timestamp}</span>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                                <p className="text-[13px] leading-relaxed font-medium pl-11 text-black/80">
+                                  {segment.text}
+                                </p>
+                              </motion.div>
+                            ))
+                          ) : (
+                            <div className="h-full flex flex-col items-center justify-center text-center p-8 space-y-4 opacity-20">
+                              <Activity className="w-8 h-8" />
+                              <div className="space-y-1">
+                                <p className="text-[10px] font-bold uppercase tracking-widest">Waiting for Audio</p>
+                                <p className="text-[8px] font-medium uppercase tracking-widest max-w-[200px]">Transcripts will appear here once audio is detected from the captured stream.</p>
+                              </div>
+                            </div>
+                          )}
+                          <div ref={transcriptEndRef} />
+                        </div>
+                      </div>
+                    </div>
+                  </motion.div>
                 ) : inputMode === 'bot' ? (
                   <div className="flex flex-col gap-6">
                     <div className="bg-black/5 rounded-2xl p-6 space-y-4">
@@ -1053,55 +2164,179 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="w-full h-[300px] bg-white border border-black/10 rounded-xl p-4 overflow-y-auto custom-scrollbar space-y-4 shadow-sm">
-                        {transcriptSegments.length > 0 ? (
-                          transcriptSegments.map((segment, index) => (
-                            <div key={index} className={cn(
-                              "p-3 rounded-xl transition-all border",
-                              isFetchingTranscript && index === transcriptSegments.length - 1
-                                ? "bg-red-50 border-red-100 shadow-sm" 
-                                : "bg-black/[0.02] border-transparent"
-                            )}>
-                              <div className="flex items-center justify-between mb-1">
-                                <div className="flex items-center gap-2">
-                                  <span className={cn(
-                                    "text-[8px] font-black uppercase tracking-widest",
-                                    segment.speaker === 'Architect' ? "text-red-600" : "text-black"
-                                  )}>
-                                    {segment.speaker}
-                                  </span>
-                                  {speakerAccents[segment.speaker] && (
-                                    <span className="text-[7px] font-bold text-black/30 uppercase tracking-tighter">
-                                      ({speakerAccents[segment.speaker]} Accent)
-                                    </span>
-                                  )}
-                                </div>
-                                <span className="text-[7px] font-mono text-black/20 group-hover:text-black/40 transition-colors">
-                                  {segment.timestamp}
-                                </span>
-                              </div>
-                              <p className="text-[11px] text-black/70 leading-relaxed font-medium">
-                                {segment.text}
-                              </p>
-                            </div>
-                          ))
-                        ) : (
-                          <div className="h-full flex flex-col items-center justify-center text-center space-y-2 opacity-20">
-                            {botId ? (
-                              <>
-                                <Loader2 className="w-6 h-6 animate-spin" />
-                                <p className="text-[10px] font-bold uppercase tracking-widest">Waiting for transcript...</p>
-                                <p className="text-[9px] font-medium">Bot is in the meeting — transcript will appear here</p>
-                              </>
+                      <div className="flex items-center justify-between mb-4">
+                        <div className="flex items-center gap-2">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full animate-pulse",
+                            botStatus === 'recording' ? "bg-emerald-500" : "bg-red-500"
+                          )} />
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-black/40">Status: {botStatus}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={handleAutoLabelRoles}
+                            disabled={isDiarizing || transcriptSegments.length === 0}
+                            className={cn(
+                              "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
+                              isDiarizing || transcriptSegments.length === 0
+                                ? "bg-black/5 text-black/20 cursor-not-allowed" 
+                                : "bg-black/5 text-black/60 hover:bg-black/10"
+                            )}
+                          >
+                            {isDiarizing ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
                             ) : (
-                              <>
-                                <MessageSquare className="w-6 h-6" />
-                                <p className="text-[10px] font-bold uppercase tracking-widest">Join a meeting to start</p>
-                                <p className="text-[9px] font-medium">Enter a meeting URL above and click Join Bot</p>
-                              </>
+                              <Users className="w-3 h-3" />
+                            )}
+                            {isDiarizing ? "Diarizing..." : "Auto-Label Roles"}
+                          </button>
+                          <button 
+                            onClick={fetchFullTranscript}
+                            disabled={isSyncingFull}
+                            className={cn(
+                              "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
+                              isSyncingFull 
+                                ? "bg-black/5 text-black/20 cursor-not-allowed" 
+                                : "bg-black/5 text-black/60 hover:bg-black/10"
+                            )}
+                          >
+                            {isSyncingFull ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Download className="w-3 h-3" />
+                            )}
+                            {isSyncingFull ? "Syncing..." : "Fetch Complete Transcript"}
+                          </button>
+                          <button 
+                            onClick={() => botId && pollTranscript(botId)}
+                            className="p-1.5 hover:bg-black/5 rounded-lg transition-colors"
+                            title="Refresh Transcript"
+                          >
+                            <RefreshCw className={cn("w-3.5 h-3.5 text-black/40", isFetchingTranscript && "animate-spin")} />
+                          </button>
+                          <button 
+                            onClick={() => {
+                              setShowDebug(!showDebug);
+                              if (!showDebug) fetchDebugLogs();
+                            }}
+                            className="p-1.5 hover:bg-black/5 rounded-lg transition-colors"
+                            title="Debug Info"
+                          >
+                            <Settings className="w-3.5 h-3.5 text-black/40" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {showDebug && (
+                        <div className="mb-4 p-3 bg-black/5 rounded-xl border border-black/10 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-[9px] font-bold uppercase tracking-widest text-black/60">Debug: Webhook Logs</h4>
+                            <div className="flex gap-2">
+                              <button onClick={testWebhook} className="text-[8px] font-bold uppercase text-emerald-600 hover:underline">Test Webhook</button>
+                              <button onClick={fetchDebugLogs} className="text-[8px] font-bold uppercase text-blue-600 hover:underline">Refresh Logs</button>
+                            </div>
+                          </div>
+                          <div className="max-h-[150px] overflow-y-auto text-[8px] font-mono space-y-1 custom-scrollbar">
+                            {debugLogs.length > 0 ? (
+                              debugLogs.map((log, i) => (
+                                <div key={i} className="border-b border-black/5 pb-1">
+                                  <span className="text-black/40">[{new Date(log.timestamp).toLocaleTimeString()}]</span>{" "}
+                                  <span className="text-blue-600">{log.event}</span>{" "}
+                                  <span className="text-black/60">Bot: {log.bot_id}</span>
+                                </div>
+                              ))
+                            ) : (
+                              <div className="text-black/30 italic">No logs yet...</div>
                             )}
                           </div>
-                        )}
+                          {botId && (
+                            <div className="text-[8px] text-black/40 break-all">
+                              Current Bot ID: <span className="text-black/80 font-bold">{botId}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                        <div className="w-full h-[400px] bg-white border border-black/10 rounded-xl p-4 overflow-y-auto custom-scrollbar space-y-4 shadow-sm relative">
+                        <AnimatePresence initial={false}>
+                          {transcriptSegments.length > 0 ? (
+                            transcriptSegments.map((segment, index) => (
+                              <motion.div 
+                                key={`${segment.timestamp}-${index}`}
+                                initial={{ opacity: 0, y: 10, scale: 0.98 }}
+                                animate={{ opacity: 1, y: 0, scale: 1 }}
+                                transition={{ duration: 0.2 }}
+                                className={cn(
+                                  "p-3 rounded-xl transition-all border group relative",
+                                  segment.is_partial 
+                                    ? "bg-emerald-50/30 border-emerald-100/50 border-dashed" 
+                                    : "bg-black/[0.02] border-transparent hover:border-black/5 hover:bg-black/[0.03]"
+                                )}
+                              >
+                                <div className="flex items-center justify-between mb-1">
+                                  <div className="flex items-center gap-2">
+                                    <div className={cn(
+                                      "w-1.5 h-1.5 rounded-full",
+                                      segment.speaker === 'Architect' ? "bg-red-500" : "bg-black/40"
+                                    )} />
+                                    <span className={cn(
+                                      "text-[8px] font-black uppercase tracking-widest",
+                                      segment.speaker === 'Architect' || speakerRoles[segment.speaker] === 'Architect' ? "text-red-600" : "text-black"
+                                    )}>
+                                      {speakerRoles[segment.speaker] ? `${segment.speaker} (${speakerRoles[segment.speaker]})` : segment.speaker}
+                                    </span>
+                                    {speakerAccents[segment.speaker] && (
+                                      <span className="text-[7px] font-bold text-black/30 uppercase tracking-tighter bg-black/5 px-1 rounded">
+                                        {speakerAccents[segment.speaker]}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    {segment.is_partial && (
+                                      <span className="flex items-center gap-1">
+                                        <span className="w-1 h-1 bg-emerald-500 rounded-full animate-ping" />
+                                        <span className="text-[7px] font-black text-emerald-600 uppercase tracking-widest">Live</span>
+                                      </span>
+                                    )}
+                                    <span className="text-[7px] font-mono text-black/20 group-hover:text-black/40 transition-colors">
+                                      {segment.timestamp}
+                                    </span>
+                                  </div>
+                                </div>
+                                <p className={cn(
+                                  "text-[11px] text-black/70 leading-relaxed font-medium",
+                                  segment.is_partial && "text-black/50"
+                                )}>
+                                  {segment.text}
+                                  {segment.is_partial && (
+                                    <span className="inline-flex ml-1">
+                                      <span className="animate-[bounce_1s_infinite] delay-0">.</span>
+                                      <span className="animate-[bounce_1s_infinite] delay-150">.</span>
+                                      <span className="animate-[bounce_1s_infinite] delay-300">.</span>
+                                    </span>
+                                  )}
+                                </p>
+                              </motion.div>
+                            ))
+                          ) : (
+                            <div className="h-full flex flex-col items-center justify-center text-center space-y-2 opacity-20">
+                              {botId ? (
+                                <>
+                                  <Loader2 className="w-6 h-6 animate-spin" />
+                                  <p className="text-[10px] font-bold uppercase tracking-widest">Waiting for transcript...</p>
+                                  <p className="text-[9px] font-medium">Bot is in the meeting — transcript will appear here</p>
+                                </>
+                              ) : (
+                                <>
+                                  <MessageSquare className="w-6 h-6" />
+                                  <p className="text-[10px] font-bold uppercase tracking-widest">Join a meeting to start</p>
+                                  <p className="text-[9px] font-medium">Enter a meeting URL above and click Join Bot</p>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </AnimatePresence>
+                        <div ref={transcriptEndRef} />
                       </div>
                     </div>
 
@@ -1160,11 +2395,17 @@ export default function App() {
                                   )}
                                 </div>
                                 <span className="text-[7px] font-mono text-black/20">
+                                  {segment.is_partial && (
+                                    <span className="mr-2 text-red-400 font-black animate-pulse">PARTIAL</span>
+                                  )}
                                   {segment.timestamp}
                                 </span>
                               </div>
-                              <p className="text-[11px] text-black/70 leading-relaxed font-medium">
-                                {segment.text}
+                              <p className={cn(
+                                "text-[11px] text-black/70 leading-relaxed font-medium",
+                                segment.is_partial && "italic opacity-60"
+                              )}>
+                                {segment.text}{segment.is_partial && "..."}
                               </p>
                             </div>
                           ))}

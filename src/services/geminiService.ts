@@ -330,6 +330,67 @@ export async function detectAccent(text: string): Promise<string> {
   }
 }
 
+export async function assignRoles(transcript: string, speakerNames: string[]): Promise<Record<string, string>> {
+  const response = await ai.models.generateContent({
+    model: "gemini-3-flash-preview",
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `Analyze the following meeting transcript and assign roles to the listed speaker names.
+            The primary roles are "Customer" and "Architect". If a speaker doesn't fit these, use "Participant".
+            
+            Speaker Names: ${speakerNames.join(', ')}
+            
+            Transcript Snippet:
+            ${transcript.slice(0, 5000)}
+            
+            Return a JSON object where keys are speaker names and values are their assigned roles.`,
+          },
+        ],
+      },
+    ],
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        additionalProperties: { type: Type.STRING },
+      },
+    },
+  });
+
+  try {
+    return JSON.parse(response.text || '{}');
+  } catch (e) {
+    return {};
+  }
+}
+
+export async function transcribeAudio(base64Audio: string, mimeType: string): Promise<string> {
+  const response = await ai.models.generateContent({
+    model: "gemini-3-flash-preview",
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            inlineData: {
+              data: base64Audio,
+              mimeType: mimeType,
+            },
+          },
+          {
+            text: "Transcribe the audio accurately. Identify different speakers if possible as 'Speaker 1', 'Speaker 2', etc. Return only the transcript text. If there is no clear speech or the audio is silent, return an empty string. Do not hallucinate or guess if the audio is unclear.",
+          },
+        ],
+      },
+    ],
+  });
+
+  return response.text || "";
+}
+
 export async function analyzeTranscript(transcript: string, documentContext?: string) {
   const contextPrompt = documentContext 
     ? `Additional Document Context:
@@ -363,12 +424,13 @@ Strategic Requirements:
    - Acceptance Criteria: Bullet list.
    - Priority + Timeline: Must-have vs nice-to-have, phases, stakeholders.
 
-2. Technical Architecture Definition: Provide an advanced-level technical explanation of the proposed architecture, detailing the design patterns (e.g., Event-Driven, Microservices), security posture, and data flow. This must be followed by a highly detailed Technical Architecture Diagram in ASCII boxed format. The diagram MUST:
-   - Use boxes, arrows, and clear boundaries to show flow and relationships.
+2. Technical Architecture Definition: Provide an advanced-level technical explanation of the proposed architecture, detailing the design patterns (e.g., Event-Driven, Microservices), security posture, and data flow. This must be followed by a highly detailed Technical Architecture Diagram in Mermaid.js format (graph TD). The diagram MUST:
+   - Use clear nodes and arrows to show flow and relationships.
    - Include specific service names (e.g., AWS Lambda, Amazon RDS, Amazon SQS).
    - Label key components with their specific roles and advanced configurations (e.g., "Auth Layer - Cognito", "Data Persistence - DynamoDB with DAX").
-   - Include brief inline annotations or callouts within the ASCII structure to explain complex interactions (e.g., "Asynchronous Processing via SQS", "Multi-AZ for High Availability").
+   - Include brief inline annotations or callouts within the Mermaid structure to explain complex interactions.
    - Be comprehensive, covering ingestion, processing, storage, and security layers.
+   - Ensure the output is a valid Mermaid.js string starting with "graph TD".
 3. Solution Set & Pricing: Group proposed solutions by category. For EACH solution, provide:
    - Name: The specific AWS service or solution.
    - Estimated Monthly Cost: A clear dollar amount (round to the nearest whole number).

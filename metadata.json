@@ -1,7 +1,8 @@
 {
-  "name": "Remix: Remix: SPIKEDAI: Document Intelligence \u0026 Cloud Strategy",
-  "description": "Enterprise document scraping and OCR for cloud modernization. Analyze chatlogs and documents from AWS, Salesforce, or Azure to generate structured cloud strategies.",
+  "name": "Granola AI Clone",
+  "description": "Real-time meeting notes and transcription with system audio and microphone capture, powered by Gemini Live API.",
   "requestFramePermissions": [
-    "microphone"
+    "microphone",
+    "display-capture"
   ]
 }
