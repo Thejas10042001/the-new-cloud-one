@@ -426,6 +426,8 @@ Strategic Requirements:
 
 2. Technical Architecture Definition: Provide an advanced-level technical explanation of the proposed architecture, detailing the design patterns (e.g., Event-Driven, Microservices), security posture, and data flow. This must be followed by a highly detailed Technical Architecture Diagram in Mermaid.js format (graph TD). The diagram MUST:
    - Use clear nodes and arrows to show flow and relationships.
+   - Use lowercase keywords (e.g., "subgraph", "graph TD").
+   - Use real newlines between nodes, NOT semicolons or literal "\n" strings.
    - Include specific service names (e.g., AWS Lambda, Amazon RDS, Amazon SQS).
    - Label key components with their specific roles and advanced configurations (e.g., "Auth Layer - Cognito", "Data Persistence - DynamoDB with DAX").
    - Include brief inline annotations or callouts within the Mermaid structure to explain complex interactions.

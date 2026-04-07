@@ -81,13 +81,33 @@ const Mermaid = ({ chart }: { chart: string }) => {
     // Remove markdown code blocks if present
     let cleaned = text.replace(/```mermaid\n?|```/g, '').trim();
     
+    // Fix literal \n strings if they exist
+    cleaned = cleaned.replace(/\\n/g, '\n');
+    
+    // Normalize subGraph to subgraph (case-insensitive)
+    cleaned = cleaned.replace(/subGraph/gi, 'subgraph');
+    
+    // Ensure space after subgraph keyword
+    cleaned = cleaned.replace(/subgraph([^\s])/g, 'subgraph $1');
+
     // Ensure it starts with a valid Mermaid keyword if not already
-    if (!cleaned.startsWith('graph') && !cleaned.startsWith('classDiagram') && !cleaned.startsWith('sequenceDiagram') && !cleaned.startsWith('stateDiagram') && !cleaned.startsWith('erDiagram') && !cleaned.startsWith('gantt') && !cleaned.startsWith('pie') && !cleaned.startsWith('flowchart')) {
+    const keywords = ['graph', 'classDiagram', 'sequenceDiagram', 'stateDiagram', 'erDiagram', 'gantt', 'pie', 'flowchart', 'mindmap', 'timeline'];
+    const startsWithKeyword = keywords.some(k => cleaned.startsWith(k));
+    
+    if (!startsWithKeyword) {
       // If it looks like it might be a graph but missing the header
-      if (cleaned.includes('-->') || cleaned.includes('---')) {
+      if (cleaned.includes('-->') || cleaned.includes('---') || cleaned.includes('[') || cleaned.includes('(')) {
         cleaned = 'graph TD\n' + cleaned;
       }
     }
+    
+    // Fix common semicolon issues - Mermaid sometimes prefers newlines over semicolons for complex structures
+    // But we should be careful not to break valid semicolons. 
+    // Often AI puts everything on one line with semicolons.
+    if (cleaned.includes(';') && !cleaned.includes('\n')) {
+      cleaned = cleaned.replace(/;/g, '\n');
+    }
+
     return cleaned;
   };
 
